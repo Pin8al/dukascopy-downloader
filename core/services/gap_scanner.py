@@ -12,7 +12,7 @@ from datetime import date, datetime, timedelta
 from config.settings import Settings
 from core.models.instrument import Instrument
 from core.models.task import HourTask, TaskStatus
-from core.services.planner import Planner, is_market_closed_hour
+from core.services.planner import Planner, trading_hours
 from storage.metadata_db import MetadataDB, _hour_key
 
 _HOUR = timedelta(hours=1)
@@ -26,10 +26,18 @@ class GapReport:
     empty: int = 0
     failed_hours: list[datetime] = field(default_factory=list)
     missing_hours: list[datetime] = field(default_factory=list)
+    empty_hours: list[datetime] = field(default_factory=list)
 
     @property
     def gap_hours(self) -> list[datetime]:
+        """Hours that were never finished: failed or never attempted."""
         return sorted(self.failed_hours + self.missing_hours)
+
+    def repair_hours(self, refetch_empty: bool = False) -> list[datetime]:
+        hours = list(self.gap_hours)
+        if refetch_empty:
+            hours.extend(self.empty_hours)
+        return sorted(hours)
 
     @property
     def is_complete(self) -> bool:
@@ -57,7 +65,7 @@ class GapScanner:
         while cursor <= end_hour:
             hours.append(cursor)
             cursor += _HOUR
-        return self._scan_hours(instrument, hours)
+        return self._scan_hours(instrument, trading_hours(instrument, hours))
 
     def _scan_hours(self, instrument: Instrument, hours: list[datetime]) -> GapReport:
         report = GapReport(instrument_id=instrument.id)
@@ -66,22 +74,26 @@ class GapScanner:
             return report
 
         recorded = self.db.status_map(instrument.id, hours[0], hours[-1])
-        skip_closed = (
-            self.settings.skip_closed_market_hours and not instrument.trades_weekends
-        )
         for hour in hours:
             status = recorded.get(_hour_key(hour))
             if status == TaskStatus.COMPLETED.value:
                 report.completed += 1
             elif status == TaskStatus.EMPTY.value:
                 report.empty += 1
+                report.empty_hours.append(hour)
             elif status == TaskStatus.FAILED.value:
                 report.failed_hours.append(hour)
-            elif skip_closed and is_market_closed_hour(hour):
-                report.empty += 1  # guaranteed closed; not a gap
             else:
                 report.missing_hours.append(hour)
         return report
 
-    def build_repair_tasks(self, instrument: Instrument, report: GapReport) -> list[HourTask]:
-        return [HourTask(instrument=instrument, hour=hour) for hour in report.gap_hours]
+    def build_repair_tasks(
+        self,
+        instrument: Instrument,
+        report: GapReport,
+        refetch_empty: bool = False,
+    ) -> list[HourTask]:
+        return [
+            HourTask(instrument=instrument, hour=hour)
+            for hour in report.repair_hours(refetch_empty=refetch_empty)
+        ]

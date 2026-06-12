@@ -3,9 +3,7 @@
 The planner:
 - clamps the range to the instrument's earliest available data and to the
   publication lag at the recent edge;
-- skips hours already recorded as completed or empty (resume for free);
-- marks guaranteed-closed market hours (Saturdays, early Sundays) as empty
-  without issuing any HTTP request, except for 24/7 crypto instruments.
+- skips hours already recorded as completed or empty (resume for free).
 """
 from __future__ import annotations
 
@@ -20,24 +18,23 @@ from storage.metadata_db import MetadataDB, _hour_key
 HOUR = timedelta(hours=1)
 
 
-def is_market_closed_hour(hour: datetime) -> bool:
-    """Hours when FX/CFD markets are guaranteed closed (UTC).
+def _fx_session_break(hour: datetime) -> bool:
+    """UTC hours outside the standard FX/CFD weekly session."""
+    wd = hour.weekday()
+    return wd == 5 or (wd == 6 and hour.hour < 20)
 
-    Friday close is ~21:00-22:00 UTC and Sunday open is ~21:00-22:00 UTC
-    depending on DST, so Saturday is always closed and Sunday is closed at
-    least until 20:00 UTC. Friday evening and late Sunday are downloaded
-    normally and simply come back empty when the market was closed.
-    """
-    if hour.weekday() == 5:  # Saturday
-        return True
-    return hour.weekday() == 6 and hour.hour < 20  # Sunday before 20:00 UTC
+
+def trading_hours(instrument: Instrument, hours: list[datetime]) -> list[datetime]:
+    """Hours this instrument is expected to have a Dukascopy feed."""
+    if instrument.continuous_trading:
+        return hours
+    return [hour for hour in hours if not _fx_session_break(hour)]
 
 
 @dataclass
 class PlanResult:
     tasks: list[HourTask] = field(default_factory=list)
     already_done: int = 0
-    auto_empty: int = 0
     total_hours: int = 0
     effective_start: datetime | None = None
     effective_end: datetime | None = None
@@ -66,7 +63,7 @@ class Planner:
         while cursor <= end:
             hours.append(cursor)
             cursor += HOUR
-        return hours
+        return trading_hours(instrument, hours)
 
     def plan(
         self,
@@ -83,18 +80,11 @@ class Planner:
         result.effective_start, result.effective_end = hours[0], hours[-1]
 
         recorded = {} if force else self.db.status_map(instrument.id, hours[0], hours[-1])
-        skip_closed = (
-            self.settings.skip_closed_market_hours and not instrument.trades_weekends
-        )
 
         for hour in hours:
             status = recorded.get(_hour_key(hour))
             if status in (TaskStatus.COMPLETED.value, TaskStatus.EMPTY.value):
                 result.already_done += 1
-                continue
-            if skip_closed and is_market_closed_hour(hour):
-                self.db.mark(instrument.id, hour, TaskStatus.EMPTY, error="market closed")
-                result.auto_empty += 1
                 continue
             result.tasks.append(HourTask(instrument=instrument, hour=hour))
         return result

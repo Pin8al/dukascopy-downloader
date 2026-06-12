@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
@@ -121,8 +122,20 @@ class DownloadEngine:
 
     # -- run --------------------------------------------------------------------
 
-    def run(self, tasks: list[HourTask], quiet: bool = False) -> DownloadStats:
-        stats = self._run_pass(tasks, label="download", quiet=quiet)
+    def run(
+        self,
+        tasks: list[HourTask],
+        quiet: bool = False,
+        on_progress: Callable[[dict], None] | None = None,
+        on_task_done: Callable[[HourTask], None] | None = None,
+    ) -> DownloadStats:
+        stats = self._run_pass(
+            tasks,
+            label="download",
+            quiet=quiet,
+            on_progress=on_progress,
+            on_task_done=on_task_done,
+        )
         for round_number in range(1, self.settings.retry_rounds + 1):
             if not stats.failed_tasks:
                 break
@@ -132,15 +145,52 @@ class DownloadEngine:
             time.sleep(min(30.0, 5.0 * round_number))
             if not quiet:
                 print(f"Retry round {round_number}: {len(retry_tasks)} failed hour(s)")
-            retry_stats = self._run_pass(retry_tasks, label=f"retry {round_number}", quiet=quiet)
+            retry_stats = self._run_pass(
+                retry_tasks,
+                label=f"retry {round_number}",
+                quiet=quiet,
+                on_progress=on_progress,
+                on_task_done=on_task_done,
+            )
             stats.merge(retry_stats)
         return stats
 
-    def _run_pass(self, tasks: list[HourTask], label: str, quiet: bool) -> DownloadStats:
+    def _run_pass(
+        self,
+        tasks: list[HourTask],
+        label: str,
+        quiet: bool,
+        on_progress: Callable[[dict], None] | None = None,
+        on_task_done: Callable[[HourTask], None] | None = None,
+    ) -> DownloadStats:
         stats = DownloadStats()
         if not tasks:
             return stats
-        progress = ProgressBar(total=len(tasks), label=label) if not quiet else None
+        use_console = not quiet and on_progress is None and on_task_done is None
+        progress = ProgressBar(total=len(tasks), label=label) if use_console else None
+        started_at = time.monotonic()
+        symbol_stats: dict[str, dict[str, int]] = {}
+
+        def emit(task: HourTask | None = None) -> None:
+            if not on_progress:
+                return
+            done = stats.completed + stats.empty + stats.failed
+            elapsed = time.monotonic() - started_at
+            rate = done / elapsed if elapsed > 0 else 0.0
+            on_progress({
+                "label": label,
+                "total": len(tasks),
+                "done": done,
+                "completed": stats.completed,
+                "empty": stats.empty,
+                "failed": stats.failed,
+                "ticks": stats.ticks,
+                "percent": round(100 * done / len(tasks), 1) if tasks else 100.0,
+                "rate": round(rate, 2),
+                "eta_seconds": int((len(tasks) - done) / rate) if rate > 0 else 0,
+                "symbol": task.instrument.symbol if task else None,
+                "symbols": symbol_stats,
+            })
 
         with ThreadPoolExecutor(max_workers=self.settings.max_workers) as pool:
             futures = {pool.submit(self._process, task): task for task in tasks}
@@ -149,15 +199,25 @@ class DownloadEngine:
                     task = futures[future]
                     try:
                         finished = future.result()
+                        sym = finished.instrument.symbol
+                        bucket = symbol_stats.setdefault(
+                            sym, {"completed": 0, "empty": 0, "failed": 0, "ticks": 0},
+                        )
                         if finished.status is TaskStatus.COMPLETED:
                             stats.completed += 1
                             stats.ticks += finished.tick_count
+                            bucket["completed"] += 1
+                            bucket["ticks"] += finished.tick_count
                             if progress:
                                 progress.update(completed=1, ticks=finished.tick_count)
                         else:
                             stats.empty += 1
+                            bucket["empty"] += 1
                             if progress:
                                 progress.update(empty=1)
+                        emit(finished)
+                        if on_task_done:
+                            on_task_done(finished)
                     except Exception as exc:  # noqa: BLE001 - record, never abort the run
                         task.status = TaskStatus.FAILED
                         task.error = str(exc)
@@ -165,8 +225,16 @@ class DownloadEngine:
                                      error=task.error)
                         stats.failed += 1
                         stats.failed_tasks.append(task)
+                        bucket = symbol_stats.setdefault(
+                            task.instrument.symbol,
+                            {"completed": 0, "empty": 0, "failed": 0, "ticks": 0},
+                        )
+                        bucket["failed"] += 1
                         if progress:
                             progress.update(failed=1)
+                        emit(task)
+                        if on_task_done:
+                            on_task_done(task)
             finally:
                 if progress:
                     progress.finish()

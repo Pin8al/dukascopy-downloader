@@ -29,8 +29,8 @@ CREATE INDEX IF NOT EXISTS idx_hour_status_lookup
     ON hour_status (instrument, status);
 """
 
-# A status may only move "upwards"; never away from completed/empty.
-_FINAL_STATUSES = {TaskStatus.COMPLETED.value, TaskStatus.EMPTY.value}
+# Completed hours are never overwritten with a worse outcome.
+_COMPLETED = TaskStatus.COMPLETED.value
 
 
 def _hour_key(hour: datetime) -> str:
@@ -69,8 +69,8 @@ class MetadataDB:
                 "SELECT status, attempts FROM hour_status WHERE instrument=? AND hour_utc=?",
                 (instrument_id, key),
             ).fetchone()
-            if row is not None and row[0] in _FINAL_STATUSES:
-                return  # never downgrade valid data
+            if row is not None and row[0] == _COMPLETED and status != TaskStatus.COMPLETED:
+                return  # never downgrade completed data
             attempts = (row[1] if row else 0) + 1
             self._conn.execute(
                 """
@@ -122,6 +122,13 @@ class MetadataDB:
             ).fetchone()
         by_status = {status: {"hours": count, "ticks": ticks} for status, count, ticks in rows}
         return {"by_status": by_status, "first_hour": span[0], "last_hour": span[1]}
+
+    def list_instruments(self) -> list[str]:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT instrument FROM hour_status ORDER BY instrument",
+            ).fetchall()
+        return [row[0] for row in rows]
 
     def recorded_span(self, instrument_id: str) -> tuple[datetime, datetime] | None:
         """First and last hour recorded in the ledger for this instrument."""

@@ -11,7 +11,7 @@ from core.models.instrument import Instrument
 class TaskStatus(str, Enum):
     PENDING = "pending"
     COMPLETED = "completed"  # ticks downloaded, verified and persisted
-    EMPTY = "empty"          # hour valid but contains no ticks (404 / market closed)
+    EMPTY = "empty"          # hour valid but contains no ticks (404 / zero-byte response)
     FAILED = "failed"        # exhausted retries
 
 

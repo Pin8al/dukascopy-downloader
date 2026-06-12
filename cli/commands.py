@@ -1,25 +1,29 @@
 """Command line interface.
 
     python main.py search <text>
-    python main.py download <SYMBOL> <START> <END> [--workers N] [--force] [--include-weekends]
+    python main.py download <SYMBOL> <START> <END> [--workers N] [--force]
     python main.py export   <SYMBOL> <START> <END>
+    python main.py export   <SYMBOL> --all
     python main.py gaps     <SYMBOL> <START> <END> [--repair]
     python main.py gaps     <SYMBOL> --all [--repair]
     python main.py status   <SYMBOL>
+    python main.py web      [--host HOST] [--port PORT]
 """
 from __future__ import annotations
 
 import argparse
 import sys
+import threading
 from datetime import date, datetime
 
 from config.settings import Settings
+from core.models.task import TaskStatus
 from core.services.download_engine import DownloadEngine
 from core.services.gap_scanner import GapScanner
 from core.services.instrument_search import InstrumentCatalog, UnknownInstrumentError
 from core.services.planner import Planner
 from export.mt5_csv_exporter import MT5CsvExporter
-from storage.metadata_db import MetadataDB
+from storage.metadata_db import MetadataDB, _hour_key
 from storage.parquet_storage import ParquetStorage
 
 
@@ -52,11 +56,26 @@ def _build_parser() -> argparse.ArgumentParser:
     p_download.add_argument("--workers", type=int, default=None, help="parallel downloads")
     p_download.add_argument("--force", action="store_true",
                             help="re-process hours even if marked completed/empty")
-    p_download.add_argument("--include-weekends", action="store_true",
-                            help="request market-closed weekend hours too")
 
     p_export = sub.add_parser("export", help="export stored ticks to MT5 tick CSV")
-    add_range_args(p_export)
+    p_export.add_argument("symbol")
+    p_export.add_argument(
+        "start",
+        nargs="?",
+        type=_parse_date,
+        help="start date YYYY-MM-DD (required unless --all)",
+    )
+    p_export.add_argument(
+        "end",
+        nargs="?",
+        type=_parse_date,
+        help="end date YYYY-MM-DD (required unless --all)",
+    )
+    p_export.add_argument(
+        "--all",
+        action="store_true",
+        help="export the full recorded range for this symbol (no start/end dates)",
+    )
 
     p_gaps = sub.add_parser("gaps", help="report (and optionally repair) missing hours")
     p_gaps.add_argument("symbol")
@@ -77,10 +96,19 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="scan the full recorded range for this symbol (no start/end dates)",
     )
-    p_gaps.add_argument("--repair", action="store_true", help="download the missing hours")
+    p_gaps.add_argument("--repair", action="store_true", help="download missing/failed hours")
+    p_gaps.add_argument(
+        "--refetch-empty",
+        action="store_true",
+        help="with --repair, also re-request hours already marked empty",
+    )
 
     p_status = sub.add_parser("status", help="show stored data summary for an instrument")
     p_status.add_argument("symbol")
+
+    p_web = sub.add_parser("web", help="start the web UI")
+    p_web.add_argument("--host", default="127.0.0.1")
+    p_web.add_argument("--port", type=int, default=8080)
 
     return parser
 
@@ -111,8 +139,6 @@ def cmd_download(settings: Settings, catalog: InstrumentCatalog, args) -> int:
     _validate_range(args.start, args.end)
     if args.workers:
         settings.max_workers = args.workers
-    if args.include_weekends:
-        settings.skip_closed_market_hours = False
 
     db = MetadataDB(settings.db_path)
     storage = ParquetStorage(settings.data_dir)
@@ -128,8 +154,7 @@ def cmd_download(settings: Settings, catalog: InstrumentCatalog, args) -> int:
         return 0
     print(f"Range      : {plan.effective_start:%Y-%m-%d %H:%M} -> "
           f"{plan.effective_end:%Y-%m-%d %H:%M} UTC ({plan.total_hours} hours)")
-    print(f"Plan       : {len(plan.tasks)} to download, {plan.already_done} already done, "
-          f"{plan.auto_empty} market-closed\n")
+    print(f"Plan       : {len(plan.tasks)} to download, {plan.already_done} already done\n")
 
     if not plan.tasks:
         print("All hours already downloaded. Nothing to do.")
@@ -147,21 +172,39 @@ def cmd_download(settings: Settings, catalog: InstrumentCatalog, args) -> int:
 
 def cmd_export(settings: Settings, catalog: InstrumentCatalog, args) -> int:
     instrument = catalog.get(args.symbol)
-    _validate_range(args.start, args.end)
+    if args.all and (args.start or args.end):
+        raise SystemExit("error: --all cannot be combined with start/end dates")
+    if not args.all and (args.start is None or args.end is None):
+        raise SystemExit("error: start and end dates are required (or use --all)")
 
     db = MetadataDB(settings.db_path)
     storage = ParquetStorage(settings.data_dir)
     planner = Planner(settings, db)
     scanner = GapScanner(settings, db)
+    exporter = MT5CsvExporter(settings, storage, planner)
 
-    report = scanner.scan(instrument, args.start, args.end)
-    if not report.is_complete:
+    if args.all:
+        span = db.recorded_span(instrument.id)
+        if span is None:
+            print(f"No data recorded for {instrument.symbol} yet.")
+            return 0
+        report = scanner.scan_all(instrument)
+        range_label = (
+            f"{span[0]:%Y-%m-%d %H:%M} -> {span[1]:%Y-%m-%d %H:%M} UTC (all recorded)"
+        )
+        result = exporter.export_all(instrument, span[0], span[1])
+    else:
+        _validate_range(args.start, args.end)
+        report = scanner.scan(instrument, args.start, args.end)
+        range_label = f"{args.start} -> {args.end}"
+        result = exporter.export(instrument, args.start, args.end)
+
+    if report and not report.is_complete:
         print(f"warning: {len(report.gap_hours)} hour(s) in range are not downloaded "
               f"({len(report.missing_hours)} missing, {len(report.failed_hours)} failed). "
               "The CSV will have gaps. Run the download/gaps command first for full data.\n")
 
-    exporter = MT5CsvExporter(settings, storage, planner)
-    result = exporter.export(instrument, args.start, args.end)
+    print(f"Exporting {instrument.symbol} {range_label}")
     print(f"Exported {result.rows:,} ticks from {result.hours_with_data} hours")
     print(f"  -> {result.path}")
     return 0
@@ -196,24 +239,94 @@ def cmd_gaps(settings: Settings, catalog: InstrumentCatalog, args) -> int:
           f"{report.empty} empty, {len(report.failed_hours)} failed, "
           f"{len(report.missing_hours)} never attempted")
 
-    if report.is_complete:
+    repair_hours = report.repair_hours(refetch_empty=args.refetch_empty)
+    if not repair_hours:
         print("Dataset is complete.")
         return 0
 
     if not args.repair:
-        preview = ", ".join(f"{h:%Y-%m-%d %H:00}" for h in report.gap_hours[:10])
-        print(f"Gap hours (first 10): {preview}")
-        print("Run with --repair to download them.")
+        if report.gap_hours:
+            print(f"Gap hours ({len(report.gap_hours)}):")
+            for hour in report.gap_hours:
+                print(f"  {hour:%Y-%m-%d %H:00}")
+            print("Run with --repair to download them.")
+        if report.empty_hours:
+            print(
+                f"Also {len(report.empty_hours)} hour(s) marked empty "
+                f"(use --repair --refetch-empty to re-request them)."
+            )
         return 1
 
     storage = ParquetStorage(settings.data_dir)
     engine = DownloadEngine(settings, storage, db)
-    tasks = scanner.build_repair_tasks(instrument, report)
-    print(f"Repairing {len(tasks)} hour(s)...\n")
-    stats = engine.run(tasks)
+    tasks = scanner.build_repair_tasks(instrument, report, refetch_empty=args.refetch_empty)
+    parts = []
+    if report.gap_hours:
+        parts.append(f"{len(report.gap_hours)} gap")
+    if args.refetch_empty and report.empty_hours:
+        parts.append(f"{len(report.empty_hours)} empty refetch")
+
+    reasons: dict[str, str] = {}
+    for hour in report.gap_hours:
+        reasons[_hour_key(hour)] = "gap"
+    for hour in report.empty_hours:
+        reasons[_hour_key(hour)] = "empty refetch"
+
+    print(f"Repairing {len(tasks)} hour(s) ({', '.join(parts)}):")
+    for task in sorted(tasks, key=lambda t: t.hour):
+        reason = reasons.get(_hour_key(task.hour), "repair")
+        print(f"  {task.hour:%Y-%m-%d %H:00} UTC  [{reason}]")
+    print()
+
+    log_lock = threading.Lock()
+
+    def on_task_done(task) -> None:
+        reason = reasons.get(_hour_key(task.hour), "repair")
+        with log_lock:
+            if task.status is TaskStatus.COMPLETED:
+                print(f"  {task.hour:%Y-%m-%d %H:00} UTC  [{reason}] -> {task.tick_count:,} ticks")
+            elif task.status is TaskStatus.EMPTY:
+                print(f"  {task.hour:%Y-%m-%d %H:00} UTC  [{reason}] -> still empty")
+            else:
+                print(f"  {task.hour:%Y-%m-%d %H:00} UTC  [{reason}] -> failed: {task.error}")
+
+    stats = engine.run(tasks, on_task_done=on_task_done)
     print(f"\nRepair done: {stats.completed} with data, {stats.empty} empty, "
           f"{stats.failed} still failing.")
     return 1 if stats.failed else 0
+
+
+def _port_available(host: str, port: int) -> bool:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind((host, port))
+        except OSError:
+            return False
+    return True
+
+
+def _resolve_web_port(host: str, port: int) -> int:
+    if _port_available(host, port):
+        return port
+    for candidate in range(port + 1, port + 20):
+        if _port_available(host, candidate):
+            print(f"Port {port} is already in use, using {candidate} instead.")
+            return candidate
+    raise SystemExit(
+        f"error: no free port found near {port}. "
+        f"Stop the other process or run: python main.py web --port 9000"
+    )
+
+
+def cmd_web(args) -> int:
+    import uvicorn
+
+    port = _resolve_web_port(args.host, args.port)
+    print(f"Web UI: http://{args.host}:{port}")
+    uvicorn.run("web.app:app", host=args.host, port=port, reload=False)
+    return 0
 
 
 def cmd_status(settings: Settings, catalog: InstrumentCatalog, args) -> int:
@@ -256,6 +369,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_gaps(settings, catalog, args)
         if args.command == "status":
             return cmd_status(settings, catalog, args)
+        if args.command == "web":
+            return cmd_web(args)
     except UnknownInstrumentError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

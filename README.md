@@ -12,7 +12,17 @@ pip install -r requirements.txt
 
 Requires Python 3.10+.
 
-## Usage
+## Web UI
+
+```powershell
+python main.py web
+# open http://127.0.0.1:8080
+```
+
+Minimal white-themed interface for search, **bulk download** (multiple symbols in one
+job), export, gap scan/repair, stored-data library, and live job progress.
+
+## Usage (CLI)
 
 ```powershell
 # Find an instrument (1600+ in the bundled catalog)
@@ -28,18 +38,22 @@ python main.py gaps EURUSD 2025-01-01 2025-06-30 --repair
 # Scan the entire recorded range (no dates needed)
 python main.py gaps EURUSD --all
 python main.py gaps EURUSD --all --repair
+python main.py gaps EURUSD --all --repair --refetch-empty   # also re-request empty hours
 
 # Export an MT5 tick CSV from stored Parquet
 python main.py export EURUSD 2025-01-01 2025-06-30
 #   -> exports/EURUSD/EURUSD_2025-01-01_2025-06-30.csv
+
+# Export the entire recorded range (no dates needed)
+python main.py export EURUSD --all
+#   -> exports/EURUSD/EURUSD_2025-01-01_2025-12-31_all.csv
 
 # What is stored locally?
 python main.py status EURUSD
 ```
 
 `download` options: `--workers N` (default 16), `--force` (reprocess
-completed hours), `--include-weekends` (also request market-closed hours;
-crypto instruments always include weekends).
+completed hours).
 
 ## How it works
 
@@ -60,10 +74,10 @@ plan hours -> fetch .bi5 (parallel) -> LZMA decode -> verify -> Parquet (atomic)
   5xx responses; corrupt payloads (LZMA/structure/verification failures)
   trigger a fresh fetch. Hours that still fail get extra retry rounds, then
   remain flagged for `gaps --repair`. Temporary failures never abort a run.
-- **Planner** clamps ranges to each instrument's earliest available data,
-  skips the not-yet-published most recent hours, and marks guaranteed
-  market-closed hours (Saturdays, early Sundays UTC) empty without any HTTP
-  request — except for 24/7 crypto instruments.
+- **Planner** clamps ranges to each instrument's earliest available data and
+  skips the not-yet-published most recent hours. Every other hour is fetched
+  from Dukascopy; hours with no data are recorded as empty only after a 404
+  or zero-byte response.
 - **Verification** checks record structure, timestamp monotonicity and bounds,
   positive prices, and plausible spreads before anything is persisted.
 - **Instrument catalog** (`config/instruments.json`) carries the per-instrument

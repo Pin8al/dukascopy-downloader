@@ -12,7 +12,7 @@ class Instrument:
     description: str
     decimal_factor: int  # raw integer price divided by this gives the real price
     earliest_tick_utc: datetime | None = None
-    trades_weekends: bool = False
+    continuous_trading: bool = False  # e.g. crypto — no FX session breaks
 
     @property
     def symbol(self) -> str:

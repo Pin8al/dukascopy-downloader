@@ -34,9 +34,6 @@ class Settings:
     retry_rounds: int = 2
 
     # Planning
-    # Skip hours where the FX/CFD market is guaranteed closed (Saturdays,
-    # early Sundays). Crypto instruments are never skipped.
-    skip_closed_market_hours: bool = True
     # The most recent hours are not yet published by Dukascopy.
     min_data_lag_hours: int = 2
 

@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dukascopy Downloader</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div>
+        <h1>Dukascopy Downloader</h1>
+        <p>Parquet storage &middot; MT5 export &middot; gap repair</p>
+      </div>
+    </header>
+
+    <nav class="tabs" role="tablist">
+      <button class="tab active" data-tab="download">Download</button>
+      <button class="tab" data-tab="export">Export</button>
+      <button class="tab" data-tab="gaps">Gaps</button>
+      <button class="tab" data-tab="library">Library</button>
+      <button class="tab" data-tab="jobs">Jobs</button>
+    </nav>
+
+    <!-- Download -->
+    <section id="panel-download" class="panel active">
+      <div class="card">
+        <h2>Bulk download</h2>
+        <div class="field search-wrap">
+          <label for="dl-search">Instruments</label>
+          <input type="text" id="dl-search" placeholder="Search symbol or name (e.g. EURUSD, gold)…" autocomplete="off">
+          <div id="dl-suggestions" class="suggestions"></div>
+          <div id="dl-chips" class="chips"></div>
+          <p class="hint">Add multiple symbols to download them together in one job.</p>
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label for="dl-start">Start date</label>
+            <input type="date" id="dl-start">
+          </div>
+          <div class="field">
+            <label for="dl-end">End date</label>
+            <input type="date" id="dl-end">
+          </div>
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label for="dl-workers">Workers</label>
+            <input type="number" id="dl-workers" min="1" max="64" value="16">
+          </div>
+          <div class="field" style="display:flex;align-items:flex-end;padding-bottom:0.15rem">
+            <label class="checkbox"><input type="checkbox" id="dl-force"> Force re-download</label>
+          </div>
+        </div>
+        <button class="btn btn-primary" id="dl-start-btn">Start download</button>
+      </div>
+    </section>
+
+    <!-- Export -->
+    <section id="panel-export" class="panel">
+      <div class="card">
+        <h2>Export to MT5 CSV</h2>
+        <div class="field search-wrap">
+          <label for="ex-search">Instrument</label>
+          <input type="text" id="ex-search" placeholder="Symbol…" autocomplete="off">
+          <div id="ex-suggestions" class="suggestions"></div>
+          <input type="hidden" id="ex-symbol">
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label for="ex-start">Start date</label>
+            <input type="date" id="ex-start">
+          </div>
+          <div class="field">
+            <label for="ex-end">End date</label>
+            <input type="date" id="ex-end">
+          </div>
+        </div>
+        <button class="btn btn-primary" id="ex-start-btn">Export CSV</button>
+      </div>
+      <div class="card">
+        <h2>Recent exports</h2>
+        <div id="export-list"><p class="empty">Loading…</p></div>
+      </div>
+    </section>
+
+    <!-- Gaps -->
+    <section id="panel-gaps" class="panel">
+      <div class="card">
+        <h2>Gap scanner</h2>
+        <div class="field search-wrap">
+          <label for="gp-search">Instrument</label>
+          <input type="text" id="gp-search" placeholder="Symbol…" autocomplete="off">
+          <div id="gp-suggestions" class="suggestions"></div>
+          <input type="hidden" id="gp-symbol">
+        </div>
+        <label class="checkbox" style="margin-bottom:1rem">
+          <input type="checkbox" id="gp-all"> Scan entire recorded range (no dates)
+        </label>
+        <div class="grid-2" id="gp-dates">
+          <div class="field">
+            <label for="gp-start">Start date</label>
+            <input type="date" id="gp-start">
+          </div>
+          <div class="field">
+            <label for="gp-end">End date</label>
+            <input type="date" id="gp-end">
+          </div>
+        </div>
+        <div class="row">
+          <button class="btn" id="gp-scan-btn">Scan</button>
+          <button class="btn btn-primary" id="gp-repair-btn">Scan &amp; repair</button>
+        </div>
+        <div id="gp-result"></div>
+      </div>
+    </section>
+
+    <!-- Library -->
+    <section id="panel-library" class="panel">
+      <div class="card">
+        <h2>Stored data</h2>
+        <button class="btn" id="lib-refresh" style="margin-bottom:1rem">Refresh</button>
+        <div id="library-table"><p class="empty">Loading…</p></div>
+      </div>
+    </section>
+
+    <!-- Jobs -->
+    <section id="panel-jobs" class="panel">
+      <div class="card">
+        <h2>Job history</h2>
+        <button class="btn" id="jobs-refresh" style="margin-bottom:1rem">Refresh</button>
+        <div id="jobs-list"><p class="empty">No jobs yet.</p></div>
+      </div>
+    </section>
+  </div>
+
+  <div id="toast" class="toast"></div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

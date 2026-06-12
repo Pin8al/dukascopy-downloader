@@ -12,7 +12,7 @@ Parquet remains the source of truth.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from config.settings import Settings
@@ -38,13 +38,41 @@ class MT5CsvExporter:
         self.planner = planner
 
     def export(self, instrument: Instrument, start_date: date, end_date: date) -> ExportResult:
+        hours = self.planner.hours_in_range(instrument, start_date, end_date)
+        out_path = self._output_path(instrument, start_date, end_date)
+        return self._export_hours(instrument, hours, out_path)
+
+    def export_all(
+        self, instrument: Instrument, start_hour: datetime, end_hour: datetime
+    ) -> ExportResult:
+        """Export every stored hour between the ledger's first and last entry."""
+        hours = []
+        cursor = start_hour
+        while cursor <= end_hour:
+            hours.append(cursor)
+            cursor += timedelta(hours=1)
+        out_path = self._output_path(
+            instrument, start_hour.date(), end_hour.date(), suffix="_all"
+        )
+        return self._export_hours(instrument, hours, out_path)
+
+    def _output_path(
+        self,
+        instrument: Instrument,
+        start_date: date,
+        end_date: date,
+        suffix: str = "",
+    ) -> Path:
         out_dir = self.settings.export_dir / instrument.symbol
         out_dir.mkdir(parents=True, exist_ok=True)
-        out_path = out_dir / (
-            f"{instrument.symbol}_{start_date.isoformat()}_{end_date.isoformat()}.csv"
+        return out_dir / (
+            f"{instrument.symbol}_{start_date.isoformat()}_"
+            f"{end_date.isoformat()}{suffix}.csv"
         )
 
-        hours = self.planner.hours_in_range(instrument, start_date, end_date)
+    def _export_hours(
+        self, instrument: Instrument, hours: list[datetime], out_path: Path
+    ) -> ExportResult:
         digits = instrument.price_decimals
         rows = 0
         hours_with_data = 0

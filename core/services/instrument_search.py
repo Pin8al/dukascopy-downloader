@@ -12,14 +12,20 @@ from pathlib import Path
 
 from core.models.instrument import Instrument
 
-# Crypto base currencies traded 24/7 on Dukascopy. Used to decide whether
-# weekend hours can be safely skipped during planning.
-_CRYPTO_BASES = {
+_CONTINUOUS_BASES = {
     "ada", "ave", "bat", "bch", "btc", "cmp", "dog", "dot", "dsh", "enj",
     "eos", "eth", "lnk", "ltc", "mat", "mkr", "sol", "trx", "uni", "xlm",
     "xmr", "xrp", "yfi", "zec",
 }
-_FIAT_QUOTES = ("usd", "eur", "gbp", "chf", "jpy")
+_CONTINUOUS_QUOTES = ("usd", "eur", "gbp", "chf", "jpy")
+
+
+def _continuous_trading(instrument_id: str) -> bool:
+    return (
+        len(instrument_id) == 6
+        and instrument_id[:3] in _CONTINUOUS_BASES
+        and instrument_id[3:] in _CONTINUOUS_QUOTES
+    )
 
 
 class UnknownInstrumentError(Exception):
@@ -35,14 +41,6 @@ def _parse_iso(value: str | None) -> datetime | None:
         return None
 
 
-def _is_crypto(instrument_id: str) -> bool:
-    return (
-        len(instrument_id) == 6
-        and instrument_id[:3] in _CRYPTO_BASES
-        and instrument_id[3:] in _FIAT_QUOTES
-    )
-
-
 class InstrumentCatalog:
     def __init__(self, catalog_file: Path):
         with open(catalog_file, encoding="utf-8") as fh:
@@ -55,7 +53,7 @@ class InstrumentCatalog:
                 description=meta.get("description", ""),
                 decimal_factor=int(meta.get("decimalFactor", 100000)),
                 earliest_tick_utc=_parse_iso(meta.get("startHourForTicks")),
-                trades_weekends=_is_crypto(instrument_id),
+                continuous_trading=_continuous_trading(instrument_id),
             )
 
     def get(self, query: str) -> Instrument:
