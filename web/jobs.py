@@ -12,7 +12,8 @@ from typing import Any
 from config.settings import Settings
 from core.exceptions import JobCancelled
 from core.services.download_engine import DownloadEngine
-from core.services.gap_scanner import GapScanner
+from core.exceptions import IncompleteDatasetError
+from core.services.gap_scanner import GapScanner, require_complete_export
 from core.services.instrument_search import InstrumentCatalog, UnknownInstrumentError
 from core.services.planner import Planner
 from export.mt5_csv_exporter import MT5CsvExporter
@@ -105,7 +106,11 @@ class JobManager:
 
     def list_jobs(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._lock:
-            jobs = sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
+            by_age = sorted(self._jobs.values(), key=lambda j: j.created_at, reverse=True)
+            active = [j for j in by_age if j.status in (JobStatus.PENDING, JobStatus.RUNNING)]
+            active.sort(key=lambda j: 0 if j.status == JobStatus.RUNNING else 1)
+            rest = [j for j in by_age if j.status not in (JobStatus.PENDING, JobStatus.RUNNING)]
+            jobs = active + rest
         return [job.to_dict() for job in jobs[:limit]]
 
     def submit(self, kind: str, params: dict[str, Any], worker: Callable[[Job], None]) -> Job:
@@ -156,18 +161,7 @@ def run_download_job(
     if end < start:
         raise ValueError("end date is before start date")
 
-    ceiling = workers or settings.max_workers
-    local_settings = Settings(
-        data_dir=settings.data_dir,
-        export_dir=settings.export_dir,
-        db_path=settings.db_path,
-        instruments_file=settings.instruments_file,
-        max_workers=ceiling,
-        initial_concurrency=min(settings.initial_concurrency, ceiling),
-        adaptive_throttle=settings.adaptive_throttle,
-        throttle_state_path=settings.throttle_state_path,
-        parquet_compression=settings.parquet_compression,
-    )
+    local_settings = settings.for_job(workers)
 
     planner = Planner(local_settings, metadata)
     engine = DownloadEngine(local_settings, store, metadata)
@@ -212,6 +206,7 @@ def run_download_job(
         quiet=True,
         on_progress=on_progress,
         should_cancel=job.is_cancelled,
+        refetch=force,
     )
     if job.is_cancelled():
         raise JobCancelled()
@@ -235,17 +230,22 @@ def run_export_job(
     symbol = job.params["symbol"]
     export_all = bool(job.params.get("export_all", False))
     instrument = cat.get(symbol)
+    scanner = GapScanner(settings, metadata)
     planner = Planner(settings, metadata)
     exporter = MT5CsvExporter(settings, store, planner)
     cancel = job.is_cancelled
     progress = lambda snapshot: job.set_progress(**snapshot)
 
     if export_all:
-        span = metadata.recorded_span(instrument.id)
-        if span is None:
+        report, range_label = scanner.scan_for_export(instrument, export_all=True)
+        if report is None:
             job.finish({"message": "No data recorded yet", "rows": 0, "hours_with_data": 0})
             return
-        range_label = f"{span[0]:%Y-%m-%d %H:%M} -> {span[1]:%Y-%m-%d %H:%M} UTC (all recorded)"
+        try:
+            require_complete_export(report, instrument.symbol, range_label)
+        except IncompleteDatasetError as exc:
+            raise ValueError(str(exc)) from exc
+        span = metadata.recorded_span(instrument.id)
         job.set_progress(message=f"Preparing export · {range_label}", percent=0)
         result = exporter.export_all(
             instrument, span[0], span[1],
@@ -256,7 +256,13 @@ def run_export_job(
         end = _parse_date(job.params["end"])
         if end < start:
             raise ValueError("end date is before start date")
-        range_label = f"{start} -> {end}"
+        report, range_label = scanner.scan_for_export(
+            instrument, start=start, end=end,
+        )
+        try:
+            require_complete_export(report, instrument.symbol, range_label)
+        except IncompleteDatasetError as exc:
+            raise ValueError(str(exc)) from exc
         job.set_progress(message=f"Preparing export · {range_label}", percent=0)
         result = exporter.export(
             instrument, start, end,
@@ -284,80 +290,111 @@ def run_gaps_job(
     metadata: MetadataDB,
     store: ParquetStorage,
 ) -> None:
-    symbol = job.params["symbol"]
+    symbols = job.params.get("symbols") or []
+    if not symbols and job.params.get("symbol"):
+        symbols = [job.params["symbol"]]
+    if not symbols:
+        raise ValueError("no symbols")
+
     repair = bool(job.params.get("repair", False))
     scan_all = bool(job.params.get("all", False))
-    instrument = cat.get(symbol)
+    refetch_empty = bool(job.params.get("refetch_empty", False))
     scanner = GapScanner(settings, metadata)
 
-    if scan_all:
-        report = scanner.scan_all(instrument)
-        if report is None:
-            job.finish({"message": "No data recorded yet", "complete": True})
-            return
-        span = metadata.recorded_span(instrument.id)
-        range_label = (
-            f"{span[0]:%Y-%m-%d %H:%M} -> {span[1]:%Y-%m-%d %H:%M} UTC"
-        )
-    else:
-        start = _parse_date(job.params["start"])
-        end = _parse_date(job.params["end"])
-        if end < start:
-            raise ValueError("end date is before start date")
-        report = scanner.scan(instrument, start, end)
-        range_label = f"{start} -> {end}"
+    scan_results: list[dict[str, Any]] = []
+    all_tasks = []
+    total_gap_count = 0
 
-    gap_count = len(report.gap_hours)
-    job.set_progress(
-        message="Scan complete",
-        percent=30 if repair and gap_count else 100,
-        total_hours=report.total_hours,
-        completed=report.completed,
-        empty=report.empty,
-        gap_count=gap_count,
-        range=range_label,
-    )
+    for idx, symbol in enumerate(symbols):
+        instrument = cat.get(symbol)
+        if scan_all:
+            report = scanner.scan_all(instrument)
+            if report is None:
+                scan_results.append({
+                    "symbol": instrument.symbol,
+                    "message": "No data recorded yet",
+                    "complete": True,
+                })
+                continue
+            span = metadata.recorded_span(instrument.id)
+            range_label = (
+                f"{span[0]:%Y-%m-%d %H:%M} -> {span[1]:%Y-%m-%d %H:%M} UTC"
+            )
+        else:
+            start = _parse_date(job.params["start"])
+            end = _parse_date(job.params["end"])
+            if end < start:
+                raise ValueError("end date is before start date")
+            report = scanner.scan(instrument, start, end)
+            range_label = f"{start} -> {end}"
 
-    if report.is_complete:
-        job.finish({
-            "complete": True,
+        gap_count = len(report.gap_hours)
+        total_gap_count += gap_count
+        scan_results.append({
+            "symbol": instrument.symbol,
             "range": range_label,
+            "complete": report.is_complete,
+            "gap_count": gap_count,
             "total_hours": report.total_hours,
             "completed": report.completed,
             "empty": report.empty,
+        })
+
+        if repair and not report.is_complete:
+            all_tasks.extend(
+                scanner.build_repair_tasks(
+                    instrument, report, refetch_empty=refetch_empty,
+                ),
+            )
+
+        job.set_progress(
+            message=f"Scanned {instrument.symbol}",
+            symbols=symbols,
+            percent=int((idx + 1) / len(symbols) * (30 if repair and all_tasks else 100)),
+            gap_count=total_gap_count,
+        )
+
+    if not repair:
+        job.finish({
+            "complete": all(r.get("complete") for r in scan_results),
+            "symbols": scan_results,
+            "gap_count": total_gap_count,
+        })
+        return
+
+    if not all_tasks:
+        job.finish({
+            "complete": True,
+            "symbols": scan_results,
+            "completed": 0,
+            "empty": 0,
+            "failed": 0,
+            "ticks": 0,
             "gap_count": 0,
         })
         return
 
-    if not repair:
-        job.finish({
-            "complete": False,
-            "range": range_label,
-            "total_hours": report.total_hours,
-            "completed": report.completed,
-            "empty": report.empty,
-            "gap_count": gap_count,
-            "gap_hours": [h.isoformat() for h in report.gap_hours[:20]],
-        })
-        return
-
-    tasks = scanner.build_repair_tasks(instrument, report)
-    engine = DownloadEngine(settings, store, metadata)
+    local_settings = settings.for_job(job.params.get("workers"))
+    engine = DownloadEngine(local_settings, store, metadata)
 
     def on_progress(snapshot: dict[str, Any]) -> None:
-        job.set_progress(**snapshot, message="Repairing gaps")
+        job.set_progress(**snapshot, message="Downloading")
 
     stats = engine.run(
-        tasks, quiet=True, on_progress=on_progress, should_cancel=job.is_cancelled,
+        all_tasks,
+        quiet=True,
+        on_progress=on_progress,
+        should_cancel=job.is_cancelled,
+        refetch=True,
     )
     if job.is_cancelled():
         raise JobCancelled()
     job.finish({
         "complete": stats.failed == 0,
-        "range": range_label,
-        "repaired": stats.completed,
+        "symbols": scan_results,
+        "completed": stats.completed,
         "empty": stats.empty,
-        "still_failed": stats.failed,
+        "failed": stats.failed,
         "ticks": stats.ticks,
     })
 

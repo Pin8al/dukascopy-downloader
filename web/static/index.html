@@ -84,6 +84,7 @@
             <input type="date" class="date-input" id="ex-end" lang="en-CA">
           </div>
         </div>
+        <p class="hint">Export is only allowed when the selected range has no gaps. Run Gaps → Scan &amp; repair first if needed.</p>
         <button class="btn btn-primary" id="ex-start-btn">Export CSV</button>
       </div>
       <div class="card">
@@ -97,10 +98,14 @@
       <div class="card">
         <h2>Gap scanner</h2>
         <div class="field search-wrap">
-          <label for="gp-search">Instrument</label>
-          <input type="text" id="gp-search" placeholder="Symbol…" autocomplete="off">
+          <label for="gp-search">Instruments</label>
+          <input type="text" id="gp-search" placeholder="Search symbol or name…" autocomplete="off">
           <div id="gp-suggestions" class="suggestions"></div>
-          <input type="hidden" id="gp-symbol">
+          <div id="gp-chips" class="chips"></div>
+          <div class="row gp-library-row">
+            <button type="button" class="btn" id="gp-add-library-btn">Add all from library</button>
+          </div>
+          <p class="hint">Add multiple symbols to scan them together.</p>
         </div>
         <label class="checkbox" style="margin-bottom:1rem">
           <input type="checkbox" id="gp-all"> Scan entire recorded range (no dates)

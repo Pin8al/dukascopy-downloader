@@ -141,6 +141,17 @@ class MetadataDB:
             ).fetchall()
         return [row[0] for row in rows]
 
+    def delete_instrument(self, instrument_id: str) -> int:
+        """Remove all ledger rows for an instrument. Returns rows deleted."""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM hour_status WHERE instrument=?",
+                (instrument_id,),
+            )
+            self._conn.commit()
+            self._uncommitted = 0
+            return cur.rowcount
+
     def recorded_span(self, instrument_id: str) -> tuple[datetime, datetime] | None:
         """First and last hour recorded in the ledger for this instrument."""
         summary = self.summary(instrument_id)

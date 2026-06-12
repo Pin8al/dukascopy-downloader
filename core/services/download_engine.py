@@ -59,6 +59,7 @@ class DownloadEngine:
         self._thread_local = threading.local()
         self._should_cancel: Callable[[], bool] | None = None
         self._throttle: AdaptiveThrottle | None = None
+        self._refetch = False
 
     def _session(self) -> requests.Session:
         session = getattr(self._thread_local, "session", None)
@@ -115,7 +116,7 @@ class DownloadEngine:
         if self._should_cancel and self._should_cancel():
             raise JobCancelled()
         instrument, hour = task.instrument, task.hour
-        if self.storage.has_hour(instrument, hour):
+        if not self._refetch and self.storage.has_hour(instrument, hour):
             self.db.mark(
                 instrument.id, hour, TaskStatus.COMPLETED,
                 file_path=str(self.storage.hour_path(instrument, hour)),
@@ -147,8 +148,10 @@ class DownloadEngine:
         on_progress: Callable[[dict], None] | None = None,
         on_task_done: Callable[[HourTask], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        refetch: bool = False,
     ) -> DownloadStats:
         self._should_cancel = should_cancel
+        self._refetch = refetch
         self._throttle = AdaptiveThrottle(
             self.settings.max_workers,
             self.settings.throttle_state_path,
@@ -185,6 +188,7 @@ class DownloadEngine:
             if self._throttle is not None:
                 self._throttle.save()
                 self._throttle = None
+            self._refetch = False
 
     def _run_pass(
         self,

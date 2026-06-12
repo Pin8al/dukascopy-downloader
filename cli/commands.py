@@ -19,7 +19,8 @@ from datetime import date, datetime
 from config.settings import Settings
 from core.models.task import TaskStatus
 from core.services.download_engine import DownloadEngine
-from core.services.gap_scanner import GapScanner
+from core.exceptions import IncompleteDatasetError
+from core.services.gap_scanner import GapScanner, require_complete_export
 from core.services.instrument_search import InstrumentCatalog, UnknownInstrumentError
 from core.services.planner import Planner
 from export.mt5_csv_exporter import MT5CsvExporter
@@ -101,6 +102,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_gaps.add_argument("--repair", action="store_true", help="download missing/failed hours")
     p_gaps.add_argument(
+        "--workers", type=int, default=None,
+        help="max concurrent downloads (same as download command)",
+    )
+    p_gaps.add_argument(
         "--refetch-empty",
         action="store_true",
         help="with --repair, also re-request hours already marked empty",
@@ -140,13 +145,12 @@ def cmd_search(catalog: InstrumentCatalog, args) -> int:
 def cmd_download(settings: Settings, catalog: InstrumentCatalog, args) -> int:
     instrument = catalog.get(args.symbol)
     _validate_range(args.start, args.end)
-    if args.workers:
-        settings.max_workers = args.workers
+    local_settings = settings.for_job(args.workers)
 
     db = MetadataDB(settings.db_path)
     storage = ParquetStorage(settings.data_dir, compression=settings.parquet_compression)
-    planner = Planner(settings, db)
-    engine = DownloadEngine(settings, storage, db)
+    planner = Planner(local_settings, db)
+    engine = DownloadEngine(local_settings, storage, db)
 
     plan = planner.plan(instrument, args.start, args.end, force=args.force)
     print(f"Instrument : {instrument.name} ({instrument.symbol}), "
@@ -163,7 +167,7 @@ def cmd_download(settings: Settings, catalog: InstrumentCatalog, args) -> int:
         print("All hours already downloaded. Nothing to do.")
         return 0
 
-    stats = engine.run(plan.tasks)
+    stats = engine.run(plan.tasks, refetch=args.force)
     print(f"\nDone: {stats.completed} hours with data, {stats.empty} empty, "
           f"{stats.failed} failed, {stats.ticks:,} ticks total.")
     if stats.failed:
@@ -187,25 +191,28 @@ def cmd_export(settings: Settings, catalog: InstrumentCatalog, args) -> int:
     exporter = MT5CsvExporter(settings, storage, planner)
 
     if args.all:
-        span = db.recorded_span(instrument.id)
-        if span is None:
+        report, range_label = scanner.scan_for_export(instrument, export_all=True)
+        if report is None:
             print(f"No data recorded for {instrument.symbol} yet.")
             return 0
-        report = scanner.scan_all(instrument)
-        range_label = (
-            f"{span[0]:%Y-%m-%d %H:%M} -> {span[1]:%Y-%m-%d %H:%M} UTC (all recorded)"
-        )
+        span = db.recorded_span(instrument.id)
+        try:
+            require_complete_export(report, instrument.symbol, range_label)
+        except IncompleteDatasetError as exc:
+            print(f"error: {exc}")
+            return 1
         result = exporter.export_all(instrument, span[0], span[1])
     else:
         _validate_range(args.start, args.end)
-        report = scanner.scan(instrument, args.start, args.end)
-        range_label = f"{args.start} -> {args.end}"
+        report, range_label = scanner.scan_for_export(
+            instrument, start=args.start, end=args.end,
+        )
+        try:
+            require_complete_export(report, instrument.symbol, range_label)
+        except IncompleteDatasetError as exc:
+            print(f"error: {exc}")
+            return 1
         result = exporter.export(instrument, args.start, args.end)
-
-    if report and not report.is_complete:
-        print(f"warning: {len(report.gap_hours)} hour(s) in range are not downloaded "
-              f"({len(report.missing_hours)} missing, {len(report.failed_hours)} failed). "
-              "The CSV will have gaps. Run the download/gaps command first for full data.\n")
 
     print(f"Exporting {instrument.symbol} {range_label}")
     print(f"Exported {result.rows:,} ticks from {result.hours_with_data} hours")
@@ -260,8 +267,9 @@ def cmd_gaps(settings: Settings, catalog: InstrumentCatalog, args) -> int:
             )
         return 1
 
+    local_settings = settings.for_job(args.workers)
     storage = ParquetStorage(settings.data_dir, compression=settings.parquet_compression)
-    engine = DownloadEngine(settings, storage, db)
+    engine = DownloadEngine(local_settings, storage, db)
     tasks = scanner.build_repair_tasks(instrument, report, refetch_empty=args.refetch_empty)
     parts = []
     if report.gap_hours:
@@ -293,9 +301,9 @@ def cmd_gaps(settings: Settings, catalog: InstrumentCatalog, args) -> int:
             else:
                 print(f"  {task.hour:%Y-%m-%d %H:00} UTC  [{reason}] -> failed: {task.error}")
 
-    stats = engine.run(tasks, on_task_done=on_task_done)
-    print(f"\nRepair done: {stats.completed} with data, {stats.empty} empty, "
-          f"{stats.failed} still failing.")
+    stats = engine.run(tasks, on_task_done=on_task_done, refetch=True)
+    print(f"\nDone: {stats.completed} hours with data, {stats.empty} empty, "
+          f"{stats.failed} failed, {stats.ticks:,} ticks total.")
     return 1 if stats.failed else 0
 
 

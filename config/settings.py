@@ -1,7 +1,7 @@
 """Central configuration for the downloader."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -49,3 +49,12 @@ class Settings:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.export_dir.mkdir(parents=True, exist_ok=True)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+
+    def for_job(self, workers: int | None = None) -> Settings:
+        """Download/gap-repair settings with an optional worker ceiling override."""
+        ceiling = workers or self.max_workers
+        return replace(
+            self,
+            max_workers=ceiling,
+            initial_concurrency=min(self.initial_concurrency, ceiling),
+        )

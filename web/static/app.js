@@ -3,6 +3,7 @@ const $$ = (sel) => document.querySelectorAll(sel);
 
 const state = {
   downloadSymbols: new Set(),
+  gapSymbols: new Set(),
   jobStatuses: new Map(),
   jobsPollTimer: null,
 };
@@ -92,16 +93,25 @@ async function api(path, opts = {}) {
 
 // -- tabs ---------------------------------------------------------------------
 
+const TAB_STORAGE_KEY = "activeTab";
+const VALID_TABS = new Set(["download", "export", "gaps", "library", "jobs"]);
+
+function switchTab(tabName, { save = true } = {}) {
+  if (!VALID_TABS.has(tabName)) tabName = "download";
+  $$(".tab").forEach((t) => t.classList.remove("active"));
+  $$(".panel").forEach((p) => p.classList.remove("active"));
+  const tab = $(`.tab[data-tab="${tabName}"]`);
+  if (!tab) return;
+  tab.classList.add("active");
+  $(`#panel-${tabName}`).classList.add("active");
+  if (tabName === "library") loadLibrary();
+  if (tabName === "export") loadExports();
+  if (tabName === "jobs") loadJobs();
+  if (save) localStorage.setItem(TAB_STORAGE_KEY, tabName);
+}
+
 $$(".tab").forEach((tab) => {
-  tab.addEventListener("click", () => {
-    $$(".tab").forEach((t) => t.classList.remove("active"));
-    $$(".panel").forEach((p) => p.classList.remove("active"));
-    tab.classList.add("active");
-    $(`#panel-${tab.dataset.tab}`).classList.add("active");
-    if (tab.dataset.tab === "library") loadLibrary();
-    if (tab.dataset.tab === "export") loadExports();
-    if (tab.dataset.tab === "jobs") loadJobs();
-  });
+  tab.addEventListener("click", () => switchTab(tab.dataset.tab));
 });
 
 // -- instrument search --------------------------------------------------------
@@ -184,15 +194,26 @@ setupSearch(
   true,
 );
 
-setupSearch(
-  "#gp-search",
-  "#gp-suggestions",
-  (symbol) => {
-    $("#gp-symbol").value = symbol;
-    $("#gp-search").value = symbol;
-  },
-  true,
-);
+function renderGapChips() {
+  const wrap = $("#gp-chips");
+  wrap.innerHTML = [...state.gapSymbols]
+    .map(
+      (sym) =>
+        `<span class="chip">${sym}<button type="button" data-gp-remove="${sym}" aria-label="Remove">×</button></span>`,
+    )
+    .join("");
+  wrap.querySelectorAll("[data-gp-remove]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      state.gapSymbols.delete(btn.dataset.gpRemove);
+      renderGapChips();
+    });
+  });
+}
+
+setupSearch("#gp-search", "#gp-suggestions", (symbol) => {
+  state.gapSymbols.add(symbol);
+  renderGapChips();
+});
 
 // -- dates defaults -----------------------------------------------------------
 
@@ -284,7 +305,7 @@ function renderJobCard(job) {
       ? `Download · ${(params.symbols || []).join(", ")}`
       : job.kind === "export"
         ? `Export · ${params.symbol}${params.export_all ? " (all recorded)" : ""}`
-        : `Gaps · ${params.symbol}`;
+        : `Gaps · ${(params.symbols || (params.symbol ? [params.symbol] : [])).join(", ")}`;
 
   const cancelBtn = isJobActive(job.status)
     ? `<button type="button" class="job-cancel" data-cancel="${job.id}" aria-label="Cancel job">×</button>`
@@ -299,7 +320,13 @@ function renderJobCard(job) {
       const range = r.range ? `<br>${r.range}` : "";
       body += `<p class="hint">Exported ${fmt(r.rows)} ticks from ${fmt(r.hours_with_data)} hours${range}<br><a href="/api/exports/file?path=${encodeURIComponent(r.path)}">${r.filename || r.path}</a></p>`;
     } else if (job.kind === "gaps") {
-      body += `<p class="hint">${r.complete ? "Dataset complete." : `Gaps: ${r.gap_count ?? r.still_failed ?? "?"}`}</p>`;
+      if (params.repair && r.ticks !== undefined) {
+        body += `<p class="hint">Done: ${fmt(r.completed)} with data, ${fmt(r.empty)} empty, ${fmt(r.failed)} failed, ${fmt(r.ticks)} ticks.</p>`;
+      } else if (r.complete) {
+        body += `<p class="hint">Dataset complete.</p>`;
+      } else {
+        body += `<p class="hint">Gaps: ${r.gap_count ?? "?"} hour(s) missing or failed.</p>`;
+      }
     }
   }
   if (job.status === "failed") {
@@ -359,10 +386,7 @@ function prependJob(job) {
   if (list.querySelector(".empty")) list.innerHTML = "";
   list.prepend(renderJobCard(job));
   state.jobStatuses.set(job.id, job.status);
-  $$(".tab").forEach((t) => t.classList.remove("active"));
-  $$(".panel").forEach((p) => p.classList.remove("active"));
-  $('.tab[data-tab="jobs"]').classList.add("active");
-  $("#panel-jobs").classList.add("active");
+  switchTab("jobs");
   refreshJobs();
 }
 
@@ -419,6 +443,17 @@ $("#ex-start-btn").addEventListener("click", async () => {
   }
 });
 
+async function deleteExport(path, filename) {
+  if (!confirm(`Delete ${filename}?`)) return;
+  try {
+    await api(`/api/exports/file?path=${encodeURIComponent(path)}`, { method: "DELETE" });
+    toast("Export deleted");
+    loadExports();
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
 async function loadExports() {
   try {
     const { exports } = await api("/api/exports");
@@ -431,9 +466,17 @@ async function loadExports() {
       .map(
         (f) =>
           `<tr><td>${f.filename}</td><td>${(f.size / 1024 / 1024).toFixed(2)} MB</td>
-          <td><a class="btn" href="/api/exports/file?path=${encodeURIComponent(f.path)}">Download</a></td></tr>`,
+          <td class="export-actions">
+            <a class="btn" href="/api/exports/file?path=${encodeURIComponent(f.path)}">Download</a>
+            <button type="button" class="job-cancel lib-delete" data-delete-export="${f.path}" aria-label="Delete ${f.filename}">×</button>
+          </td></tr>`,
       )
       .join("")}</tbody></table>`;
+    el.querySelectorAll("[data-delete-export]").forEach((btn) => {
+      const path = btn.dataset.deleteExport;
+      const filename = exports.find((f) => f.path === path)?.filename || path;
+      btn.addEventListener("click", () => deleteExport(path, filename));
+    });
   } catch (e) {
     $("#export-list").innerHTML = `<p class="empty">${e.message}</p>`;
   }
@@ -441,33 +484,48 @@ async function loadExports() {
 
 // -- gaps ---------------------------------------------------------------------
 
-async function runGapsPreview() {
-  const symbol = $("#gp-symbol").value || $("#gp-search").value.trim();
-  if (!symbol) return toast("Select a symbol");
+function gapScanBody(repair) {
+  const symbols = [...state.gapSymbols];
+  if (!symbols.length) throw new Error("Add at least one symbol");
   const all = $("#gp-all").checked;
-  const body = { symbol, all, repair: false };
+  const body = { symbols, all, repair };
   if (!all) {
-    try {
-      body.start = readDateInput("#gp-start", "Start date");
-      body.end = readDateInput("#gp-end", "End date");
-    } catch (e) {
-      return toast(e.message);
+    body.start = readDateInput("#gp-start", "Start date");
+    body.end = readDateInput("#gp-end", "End date");
+  }
+  if (repair) body.workers = Number($("#dl-workers").value) || 10;
+  return body;
+}
+
+function renderGapPreviewResult(r) {
+  const blocks = (r.results || []).map((item) => {
+    if (item.message) {
+      return `<div class="progress-block"><p><strong>${item.symbol}</strong> · ${item.message}</p></div>`;
     }
+    return `<div class="progress-block">
+      <p><strong>${item.symbol}</strong> · ${item.range}</p>
+      <p class="hint">${fmt(item.total_hours)} hours · ${fmt(item.completed)} with data · ${fmt(item.empty)} empty · ${fmt(item.failed)} failed · ${fmt(item.missing)} missing</p>
+      ${
+        item.complete
+          ? '<p style="color:var(--success)">Dataset is complete.</p>'
+          : `<p style="color:var(--warning)">${item.gap_count} gap hour(s)</p>
+             <p class="hint">${(item.gap_hours || []).join(", ")}</p>`
+      }
+    </div>`;
+  });
+  return blocks.join("");
+}
+
+async function runGapsPreview() {
+  let body;
+  try {
+    body = gapScanBody(false);
+  } catch (e) {
+    return toast(e.message);
   }
   try {
     const r = await api("/api/gaps/preview", { method: "POST", body: JSON.stringify(body) });
-    const el = $("#gp-result");
-    el.innerHTML = `
-      <div class="progress-block">
-        <p><strong>${r.symbol}</strong> · ${r.range}</p>
-        <p class="hint">${fmt(r.total_hours)} hours · ${fmt(r.completed)} with data · ${fmt(r.empty)} empty · ${fmt(r.failed)} failed · ${fmt(r.missing)} missing</p>
-        ${
-          r.complete
-            ? '<p style="color:var(--success)">Dataset is complete.</p>'
-            : `<p style="color:var(--warning)">${r.gap_count} gap hour(s)</p>
-               <p class="hint">${(r.gap_hours || []).join(", ")}</p>`
-        }
-      </div>`;
+    $("#gp-result").innerHTML = renderGapPreviewResult(r);
   } catch (e) {
     toast(e.message);
   }
@@ -475,18 +533,24 @@ async function runGapsPreview() {
 
 $("#gp-scan-btn").addEventListener("click", runGapsPreview);
 
+$("#gp-add-library-btn").addEventListener("click", async () => {
+  try {
+    const { instruments } = await api("/api/status");
+    if (!instruments.length) return toast("Library is empty");
+    instruments.forEach((i) => state.gapSymbols.add(i.symbol));
+    renderGapChips();
+    toast(`Added ${instruments.length} symbol${instruments.length > 1 ? "s" : ""} from library`);
+  } catch (e) {
+    toast(e.message);
+  }
+});
+
 $("#gp-repair-btn").addEventListener("click", async () => {
-  const symbol = $("#gp-symbol").value || $("#gp-search").value.trim();
-  if (!symbol) return toast("Select a symbol");
-  const all = $("#gp-all").checked;
-  const body = { symbol, all, repair: true };
-  if (!all) {
-    try {
-      body.start = readDateInput("#gp-start", "Start date");
-      body.end = readDateInput("#gp-end", "End date");
-    } catch (e) {
-      return toast(e.message);
-    }
+  let body;
+  try {
+    body = gapScanBody(true);
+  } catch (e) {
+    return toast(e.message);
   }
   try {
     const job = await api("/api/gaps", { method: "POST", body: JSON.stringify(body) });
@@ -499,6 +563,22 @@ $("#gp-repair-btn").addEventListener("click", async () => {
 
 // -- library ------------------------------------------------------------------
 
+async function deleteLibrarySymbol(symbol) {
+  if (!confirm(`Delete all stored data for ${symbol}? This cannot be undone.`)) return;
+  try {
+    await api(`/api/status/${encodeURIComponent(symbol)}`, { method: "DELETE" });
+    state.downloadSymbols.delete(symbol);
+    state.gapSymbols.delete(symbol);
+    renderDownloadChips();
+    renderGapChips();
+    toast(`${symbol} removed`);
+    loadLibrary();
+    loadExports();
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
 async function loadLibrary() {
   try {
     const { instruments } = await api("/api/status");
@@ -507,7 +587,7 @@ async function loadLibrary() {
       el.innerHTML = '<p class="empty">No data stored yet. Start a download.</p>';
       return;
     }
-    el.innerHTML = `<table><thead><tr><th>Symbol</th><th>Range (UTC)</th><th>Completed</th><th>Empty</th><th>Ticks</th></tr></thead><tbody>${instruments
+    el.innerHTML = `<table><thead><tr><th>Symbol</th><th>Range (UTC)</th><th>Completed</th><th>Empty</th><th>Ticks</th><th></th></tr></thead><tbody>${instruments
       .map((i) => {
         const c = i.by_status?.completed || { hours: 0, ticks: 0 };
         const e = i.by_status?.empty || { hours: 0 };
@@ -517,9 +597,13 @@ async function loadLibrary() {
           <td>${fmt(c.hours)}</td>
           <td>${fmt(e.hours)}</td>
           <td>${fmt(c.ticks)}</td>
+          <td class="lib-actions"><button type="button" class="job-cancel lib-delete" data-delete-symbol="${i.symbol}" aria-label="Delete ${i.symbol}">×</button></td>
         </tr>`;
       })
       .join("")}</tbody></table>`;
+    el.querySelectorAll("[data-delete-symbol]").forEach((btn) => {
+      btn.addEventListener("click", () => deleteLibrarySymbol(btn.dataset.deleteSymbol));
+    });
   } catch (e) {
     $("#library-table").innerHTML = `<p class="empty">${e.message}</p>`;
   }
@@ -534,5 +618,7 @@ $("#jobs-refresh").addEventListener("click", refreshJobs);
 
 // -- init ---------------------------------------------------------------------
 
+const savedTab = localStorage.getItem(TAB_STORAGE_KEY);
+switchTab(savedTab && VALID_TABS.has(savedTab) ? savedTab : "download", { save: false });
 loadLibrary();
 loadExports();

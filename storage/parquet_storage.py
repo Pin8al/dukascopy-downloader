@@ -10,6 +10,7 @@ never overwritten, so a crash mid-run can never corrupt stored data.
 from __future__ import annotations
 
 import os
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
@@ -127,3 +128,11 @@ class ParquetStorage:
             hours.append(hour)
         hours.sort()
         return hours
+
+    def delete_symbol(self, symbol: str) -> bool:
+        """Delete all parquet files for a symbol. Returns True if a directory was removed."""
+        root = self.data_dir / symbol
+        if not root.exists():
+            return False
+        shutil.rmtree(root)
+        return True

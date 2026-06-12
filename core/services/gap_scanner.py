@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 
 from config.settings import Settings
+from core.exceptions import IncompleteDatasetError
 from core.models.instrument import Instrument
 from core.models.task import HourTask, TaskStatus
 from core.services.planner import Planner, trading_hours
@@ -97,3 +98,41 @@ class GapScanner:
             HourTask(instrument=instrument, hour=hour)
             for hour in report.repair_hours(refetch_empty=refetch_empty)
         ]
+
+    def scan_for_export(
+        self,
+        instrument: Instrument,
+        *,
+        export_all: bool = False,
+        start: date | None = None,
+        end: date | None = None,
+    ) -> tuple[GapReport | None, str]:
+        if export_all:
+            span = self.db.recorded_span(instrument.id)
+            if span is None:
+                return None, ""
+            report = self.scan_all(instrument)
+            range_label = (
+                f"{span[0]:%Y-%m-%d %H:%M} -> {span[1]:%Y-%m-%d %H:%M} UTC (all recorded)"
+            )
+            return report, range_label
+        if start is None or end is None:
+            raise ValueError("start and end dates are required")
+        report = self.scan(instrument, start, end)
+        return report, f"{start} -> {end}"
+
+
+def require_complete_export(
+    report: GapReport | None,
+    symbol: str,
+    range_label: str,
+) -> None:
+    if report is None:
+        raise IncompleteDatasetError(f"No data recorded for {symbol} yet.")
+    if not report.is_complete:
+        missing = len(report.missing_hours)
+        failed = len(report.failed_hours)
+        raise IncompleteDatasetError(
+            f"{symbol}: {len(report.gap_hours)} hour(s) not complete in {range_label} "
+            f"({missing} missing, {failed} failed). Run gaps --repair first."
+        )

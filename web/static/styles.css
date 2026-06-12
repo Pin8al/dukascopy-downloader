@@ -211,6 +211,15 @@ input[type="date"].date-input::-webkit-calendar-picker-indicator:hover {
   min-height: 1.5rem;
 }
 
+.chips:empty {
+  min-height: 0;
+  margin-top: 0;
+}
+
+.gp-library-row {
+  margin-top: 0.5rem;
+}
+
 .chip {
   display: inline-flex;
   align-items: center;
@@ -385,6 +394,20 @@ th {
   color: var(--danger);
   border-color: #fecaca;
   background: #fef2f2;
+}
+
+.lib-actions {
+  width: 2.5rem;
+  text-align: right;
+  vertical-align: middle;
+}
+
+.export-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.4rem;
+  white-space: nowrap;
 }
 
 .symbol-grid {
