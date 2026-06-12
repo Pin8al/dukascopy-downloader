@@ -122,3 +122,12 @@ class MetadataDB:
             ).fetchone()
         by_status = {status: {"hours": count, "ticks": ticks} for status, count, ticks in rows}
         return {"by_status": by_status, "first_hour": span[0], "last_hour": span[1]}
+
+    def recorded_span(self, instrument_id: str) -> tuple[datetime, datetime] | None:
+        """First and last hour recorded in the ledger for this instrument."""
+        summary = self.summary(instrument_id)
+        if not summary["first_hour"] or not summary["last_hour"]:
+            return None
+        first = datetime.fromisoformat(summary["first_hour"]).replace(tzinfo=timezone.utc)
+        last = datetime.fromisoformat(summary["last_hour"]).replace(tzinfo=timezone.utc)
+        return first, last

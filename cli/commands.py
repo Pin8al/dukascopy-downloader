@@ -4,6 +4,7 @@
     python main.py download <SYMBOL> <START> <END> [--workers N] [--force] [--include-weekends]
     python main.py export   <SYMBOL> <START> <END>
     python main.py gaps     <SYMBOL> <START> <END> [--repair]
+    python main.py gaps     <SYMBOL> --all [--repair]
     python main.py status   <SYMBOL>
 """
 from __future__ import annotations
@@ -58,7 +59,24 @@ def _build_parser() -> argparse.ArgumentParser:
     add_range_args(p_export)
 
     p_gaps = sub.add_parser("gaps", help="report (and optionally repair) missing hours")
-    add_range_args(p_gaps)
+    p_gaps.add_argument("symbol")
+    p_gaps.add_argument(
+        "start",
+        nargs="?",
+        type=_parse_date,
+        help="start date YYYY-MM-DD (required unless --all)",
+    )
+    p_gaps.add_argument(
+        "end",
+        nargs="?",
+        type=_parse_date,
+        help="end date YYYY-MM-DD (required unless --all)",
+    )
+    p_gaps.add_argument(
+        "--all",
+        action="store_true",
+        help="scan the full recorded range for this symbol (no start/end dates)",
+    )
     p_gaps.add_argument("--repair", action="store_true", help="download the missing hours")
 
     p_status = sub.add_parser("status", help="show stored data summary for an instrument")
@@ -151,13 +169,29 @@ def cmd_export(settings: Settings, catalog: InstrumentCatalog, args) -> int:
 
 def cmd_gaps(settings: Settings, catalog: InstrumentCatalog, args) -> int:
     instrument = catalog.get(args.symbol)
-    _validate_range(args.start, args.end)
+    if args.all and (args.start or args.end):
+        raise SystemExit("error: --all cannot be combined with start/end dates")
+    if not args.all and (args.start is None or args.end is None):
+        raise SystemExit("error: start and end dates are required (or use --all)")
 
     db = MetadataDB(settings.db_path)
     scanner = GapScanner(settings, db)
-    report = scanner.scan(instrument, args.start, args.end)
 
-    print(f"{instrument.symbol} {args.start} -> {args.end}: "
+    if args.all:
+        report = scanner.scan_all(instrument)
+        if report is None:
+            print(f"No data recorded for {instrument.symbol} yet.")
+            return 0
+        span = db.recorded_span(instrument.id)
+        range_label = (
+            f"{span[0]:%Y-%m-%d %H:%M} -> {span[1]:%Y-%m-%d %H:%M} UTC (all recorded)"
+        )
+    else:
+        _validate_range(args.start, args.end)
+        report = scanner.scan(instrument, args.start, args.end)
+        range_label = f"{args.start} -> {args.end}"
+
+    print(f"{instrument.symbol} {range_label}: "
           f"{report.total_hours} hours total, {report.completed} with data, "
           f"{report.empty} empty, {len(report.failed_hours)} failed, "
           f"{len(report.missing_hours)} never attempted")

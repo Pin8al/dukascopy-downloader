@@ -7,13 +7,15 @@ empty in the ledger: hours that failed permanently, or were never attempted
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from config.settings import Settings
 from core.models.instrument import Instrument
 from core.models.task import HourTask, TaskStatus
 from core.services.planner import Planner, is_market_closed_hour
 from storage.metadata_db import MetadataDB, _hour_key
+
+_HOUR = timedelta(hours=1)
 
 
 @dataclass
@@ -41,8 +43,24 @@ class GapScanner:
         self.planner = Planner(settings, db)
 
     def scan(self, instrument: Instrument, start_date: date, end_date: date) -> GapReport:
-        report = GapReport(instrument_id=instrument.id)
         hours = self.planner.hours_in_range(instrument, start_date, end_date)
+        return self._scan_hours(instrument, hours)
+
+    def scan_all(self, instrument: Instrument) -> GapReport | None:
+        """Scan every hour between the first and last ledger entry for this symbol."""
+        span = self.db.recorded_span(instrument.id)
+        if span is None:
+            return None
+        start_hour, end_hour = span
+        hours = []
+        cursor = start_hour
+        while cursor <= end_hour:
+            hours.append(cursor)
+            cursor += _HOUR
+        return self._scan_hours(instrument, hours)
+
+    def _scan_hours(self, instrument: Instrument, hours: list[datetime]) -> GapReport:
+        report = GapReport(instrument_id=instrument.id)
         report.total_hours = len(hours)
         if not hours:
             return report

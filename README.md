@@ -25,6 +25,10 @@ python main.py download EURUSD 2025-01-01 2025-06-30
 # Check for and repair holes in the dataset
 python main.py gaps EURUSD 2025-01-01 2025-06-30 --repair
 
+# Scan the entire recorded range (no dates needed)
+python main.py gaps EURUSD --all
+python main.py gaps EURUSD --all --repair
+
 # Export an MT5 tick CSV from stored Parquet
 python main.py export EURUSD 2025-01-01 2025-06-30
 #   -> exports/EURUSD/EURUSD_2025-01-01_2025-06-30.csv
