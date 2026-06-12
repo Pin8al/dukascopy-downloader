@@ -37,5 +37,6 @@ def db() -> MetadataDB:
 def storage() -> ParquetStorage:
     global _storage
     if _storage is None:
-        _storage = ParquetStorage(settings().data_dir)
+        s = settings()
+        _storage = ParquetStorage(s.data_dir, compression=s.parquet_compression)
     return _storage

@@ -156,12 +156,17 @@ def run_download_job(
     if end < start:
         raise ValueError("end date is before start date")
 
+    ceiling = workers or settings.max_workers
     local_settings = Settings(
         data_dir=settings.data_dir,
         export_dir=settings.export_dir,
         db_path=settings.db_path,
         instruments_file=settings.instruments_file,
-        max_workers=workers or settings.max_workers,
+        max_workers=ceiling,
+        initial_concurrency=min(settings.initial_concurrency, ceiling),
+        adaptive_throttle=settings.adaptive_throttle,
+        throttle_state_path=settings.throttle_state_path,
+        parquet_compression=settings.parquet_compression,
     )
 
     planner = Planner(local_settings, metadata)

@@ -53,7 +53,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_download = sub.add_parser("download", help="download ticks into Parquet storage")
     add_range_args(p_download)
-    p_download.add_argument("--workers", type=int, default=None, help="parallel downloads")
+    p_download.add_argument(
+        "--workers", type=int, default=None,
+        help="max concurrent downloads (adaptive ceiling, default from settings)",
+    )
     p_download.add_argument("--force", action="store_true",
                             help="re-process hours even if marked completed/empty")
 
@@ -141,7 +144,7 @@ def cmd_download(settings: Settings, catalog: InstrumentCatalog, args) -> int:
         settings.max_workers = args.workers
 
     db = MetadataDB(settings.db_path)
-    storage = ParquetStorage(settings.data_dir)
+    storage = ParquetStorage(settings.data_dir, compression=settings.parquet_compression)
     planner = Planner(settings, db)
     engine = DownloadEngine(settings, storage, db)
 
@@ -178,7 +181,7 @@ def cmd_export(settings: Settings, catalog: InstrumentCatalog, args) -> int:
         raise SystemExit("error: start and end dates are required (or use --all)")
 
     db = MetadataDB(settings.db_path)
-    storage = ParquetStorage(settings.data_dir)
+    storage = ParquetStorage(settings.data_dir, compression=settings.parquet_compression)
     planner = Planner(settings, db)
     scanner = GapScanner(settings, db)
     exporter = MT5CsvExporter(settings, storage, planner)
@@ -257,7 +260,7 @@ def cmd_gaps(settings: Settings, catalog: InstrumentCatalog, args) -> int:
             )
         return 1
 
-    storage = ParquetStorage(settings.data_dir)
+    storage = ParquetStorage(settings.data_dir, compression=settings.parquet_compression)
     engine = DownloadEngine(settings, storage, db)
     tasks = scanner.build_repair_tasks(instrument, report, refetch_empty=args.refetch_empty)
     parts = []

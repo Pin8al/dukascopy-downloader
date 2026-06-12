@@ -238,6 +238,15 @@ function renderJobProgress(job) {
       <span>${fmt(p.done)}/${fmt(p.total)} hours · ok ${fmt(p.completed)} · empty ${fmt(p.empty)} · failed ${fmt(p.failed)}</span>
       <span>${fmt(p.ticks)} ticks · ${p.rate || 0} h/s · ETA ${fmtEta(p.eta_seconds)}</span>
     </div>`;
+    if (p.throttle) {
+      const t = p.throttle;
+      const rl = t.rate_limit_hits ? ` · ${t.rate_limit_hits}×429 (30s)` : "";
+      html += `
+    <div class="progress-meta throttle-meta">
+      <span>Throttle: <strong>${t.state}</strong></span>
+      <span>inflight ${t.inflight}/${t.limit} · ceiling ${t.ceiling}${rl}</span>
+    </div>`;
+    }
   }
 
   if (p.symbols && Object.keys(p.symbols).length) {
@@ -374,7 +383,7 @@ $("#dl-start-btn").addEventListener("click", async () => {
     symbols,
     start,
     end,
-    workers: Number($("#dl-workers").value) || 16,
+    workers: Number($("#dl-workers").value) || 10,
     force: $("#dl-force").checked,
   };
   try {

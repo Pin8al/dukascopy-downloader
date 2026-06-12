@@ -32,8 +32,9 @@ TICK_SCHEMA = pa.schema(
 
 
 class ParquetStorage:
-    def __init__(self, data_dir: Path):
+    def __init__(self, data_dir: Path, compression: str = "snappy"):
         self.data_dir = data_dir
+        self.compression = compression
 
     def hour_path(self, instrument: Instrument, hour: datetime) -> Path:
         h = hour.astimezone(timezone.utc)
@@ -63,7 +64,19 @@ class ParquetStorage:
             schema=TICK_SCHEMA,
         )
         tmp_path = path.with_name(path.name + ".tmp")
-        pq.write_table(table, tmp_path, compression="zstd")
+        pq.write_table(table, tmp_path, compression=self.compression)
+        os.replace(tmp_path, path)
+        return path
+
+    def write_hour_table(
+        self, instrument: Instrument, hour: datetime, table: pa.Table
+    ) -> Path:
+        path = self.hour_path(instrument, hour)
+        if path.exists():
+            return path
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(path.name + ".tmp")
+        pq.write_table(table, tmp_path, compression=self.compression)
         os.replace(tmp_path, path)
         return path
 

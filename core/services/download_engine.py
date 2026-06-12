@@ -1,28 +1,28 @@
 """Concurrent download engine.
 
-Each hour task is fully independent: fetch -> decode -> verify -> persist.
-Decode and verification failures are treated as retryable (the payload may
-simply have been corrupted in transit). Task failures never abort the run;
-they are recorded in the ledger and retried in additional rounds, and
-whatever still fails is picked up later by the gap scanner.
+Each hour: fetch -> decode -> verify -> persist. A tuned concurrency limiter
+keeps HTTP pressure in Dukascopy's sweet spot (bursting to 48+ causes 503
+storms and *slower* effective throughput than ~12–16 workers).
 """
 from __future__ import annotations
 
 import threading
 import time
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from config.settings import Settings
 from core.exceptions import JobCancelled
 from core.models.task import HourTask, TaskStatus
-from core.services.decoder import DecodeError, decode_bi5
+from core.services.adaptive_throttle import AdaptiveThrottle
+from core.services.decoder import DecodeError, decode_bi5_table
 from core.services.progress import ProgressBar
 from core.services.retry_manager import PermanentError, RetryableError, RetryManager
-from core.services.verification import verify_ticks
+from core.services.verification import verify_table
 from storage.metadata_db import MetadataDB
 from storage.parquet_storage import ParquetStorage
 
@@ -54,77 +54,91 @@ class DownloadEngine:
             settings.max_attempts,
             settings.backoff_base_seconds,
             settings.backoff_max_seconds,
+            fast=True,
         )
         self._thread_local = threading.local()
         self._should_cancel: Callable[[], bool] | None = None
-
-    # -- HTTP ----------------------------------------------------------------
+        self._throttle: AdaptiveThrottle | None = None
 
     def _session(self) -> requests.Session:
         session = getattr(self._thread_local, "session", None)
         if session is None:
             session = requests.Session()
             session.headers["User-Agent"] = self.settings.user_agent
+            pool = max(self.settings.max_workers, 16)
+            adapter = HTTPAdapter(pool_connections=pool, pool_maxsize=pool)
+            session.mount("https://", adapter)
+            session.mount("http://", adapter)
             self._thread_local.session = session
         return session
 
     def _fetch(self, url: str) -> bytes | None:
-        """Return payload bytes, or None for a valid-but-empty hour (404)."""
+        throttle = self._throttle
+        if throttle is not None:
+            throttle.acquire(self._should_cancel)
+        start = time.monotonic()
         try:
             response = self._session().get(url, timeout=self.settings.request_timeout)
         except requests.RequestException as exc:
             raise RetryableError(f"network error: {exc}") from exc
+        finally:
+            if throttle is not None:
+                throttle.release()
 
-        if response.status_code == 200:
+        elapsed = time.monotonic() - start
+        status = response.status_code
+        if throttle is not None:
+            throttle.record_fetch(status, elapsed)
+
+        if status == 200:
             return response.content
-        if response.status_code == 404:
+        if status == 404:
             return None
-        if response.status_code in _RETRYABLE_HTTP:
-            raise RetryableError(f"HTTP {response.status_code}")
-        raise PermanentError(f"HTTP {response.status_code}")
-
-    # -- per-task pipeline -----------------------------------------------------
+        if status in _RETRYABLE_HTTP:
+            raise RetryableError(f"HTTP {status}")
+        raise PermanentError(f"HTTP {status}")
 
     def _fetch_decode_verify(self, task: HourTask):
-        """One retryable unit: a corrupt payload triggers a fresh fetch."""
         raw = self._fetch(task.url(self.settings.base_url))
         if raw is None or len(raw) == 0:
             return None
         try:
-            ticks = decode_bi5(raw, task.hour_start_ms, task.instrument.decimal_factor)
+            table = decode_bi5_table(raw, task.hour_start_ms, task.instrument.decimal_factor)
         except DecodeError as exc:
             raise RetryableError(str(exc)) from exc
-        check = verify_ticks(ticks, task.hour_start_ms)
+        check = verify_table(table, task.hour_start_ms)
         if not check.ok:
             raise RetryableError(f"verification failed: {check.reason}")
-        return ticks
+        return table
 
     def _process(self, task: HourTask) -> HourTask:
         if self._should_cancel and self._should_cancel():
             raise JobCancelled()
         instrument, hour = task.instrument, task.hour
         if self.storage.has_hour(instrument, hour):
-            # File already on disk (e.g. ledger was deleted): trust it.
-            self.db.mark(instrument.id, hour, TaskStatus.COMPLETED,
-                         file_path=str(self.storage.hour_path(instrument, hour)))
+            self.db.mark(
+                instrument.id, hour, TaskStatus.COMPLETED,
+                file_path=str(self.storage.hour_path(instrument, hour)),
+            )
             task.status = TaskStatus.COMPLETED
             return task
 
-        ticks = self.retry.run(lambda: self._fetch_decode_verify(task))
+        table = self.retry.run(lambda: self._fetch_decode_verify(task))
 
-        if not ticks:
+        if table is None:
             self.db.mark(instrument.id, hour, TaskStatus.EMPTY)
             task.status = TaskStatus.EMPTY
             return task
 
-        path = self.storage.write_hour(instrument, hour, ticks)
-        self.db.mark(instrument.id, hour, TaskStatus.COMPLETED,
-                     tick_count=len(ticks), file_path=str(path))
+        tick_count = table.num_rows
+        path = self.storage.write_hour_table(instrument, hour, table)
+        self.db.mark(
+            instrument.id, hour, TaskStatus.COMPLETED,
+            tick_count=tick_count, file_path=str(path),
+        )
         task.status = TaskStatus.COMPLETED
-        task.tick_count = len(ticks)
+        task.tick_count = tick_count
         return task
-
-    # -- run --------------------------------------------------------------------
 
     def run(
         self,
@@ -135,33 +149,42 @@ class DownloadEngine:
         should_cancel: Callable[[], bool] | None = None,
     ) -> DownloadStats:
         self._should_cancel = should_cancel
-        stats = self._run_pass(
-            tasks,
-            label="download",
-            quiet=quiet,
-            on_progress=on_progress,
-            on_task_done=on_task_done,
+        self._throttle = AdaptiveThrottle(
+            self.settings.max_workers,
+            self.settings.throttle_state_path,
+            initial=self.settings.initial_concurrency,
+            enabled=self.settings.adaptive_throttle,
         )
-        if should_cancel and should_cancel():
-            return stats
-        for round_number in range(1, self.settings.retry_rounds + 1):
-            if not stats.failed_tasks:
-                break
-            retry_tasks = stats.failed_tasks
-            stats.failed_tasks = []
-            stats.failed = 0
-            time.sleep(min(30.0, 5.0 * round_number))
-            if not quiet:
-                print(f"Retry round {round_number}: {len(retry_tasks)} failed hour(s)")
-            retry_stats = self._run_pass(
-                retry_tasks,
-                label=f"retry {round_number}",
-                quiet=quiet,
-                on_progress=on_progress,
-                on_task_done=on_task_done,
+        try:
+            stats = self._run_pass(
+                tasks, label="download", quiet=quiet,
+                on_progress=on_progress, on_task_done=on_task_done,
             )
-            stats.merge(retry_stats)
-        return stats
+            if should_cancel and should_cancel():
+                return stats
+            for round_number in range(1, self.settings.retry_rounds + 1):
+                if not stats.failed_tasks:
+                    break
+                retry_tasks = stats.failed_tasks
+                stats.failed_tasks = []
+                stats.failed = 0
+                time.sleep(min(15.0, 3.0 * round_number))
+                if not quiet:
+                    print(f"Retry round {round_number}: {len(retry_tasks)} failed hour(s)")
+                retry_stats = self._run_pass(
+                    retry_tasks,
+                    label=f"retry {round_number}",
+                    quiet=quiet,
+                    on_progress=on_progress,
+                    on_task_done=on_task_done,
+                )
+                stats.merge(retry_stats)
+            return stats
+        finally:
+            self.db.flush()
+            if self._throttle is not None:
+                self._throttle.save()
+                self._throttle = None
 
     def _run_pass(
         self,
@@ -174,12 +197,21 @@ class DownloadEngine:
         stats = DownloadStats()
         if not tasks:
             return stats
+        throttle = self._throttle
+        assert throttle is not None
+
+        workers = self.settings.max_workers
         use_console = not quiet and on_progress is None and on_task_done is None
         progress = ProgressBar(total=len(tasks), label=label) if use_console else None
         started_at = time.monotonic()
         symbol_stats: dict[str, dict[str, int]] = {}
+        task_index = 0
+        pending: dict[Future, HourTask] = {}
 
         def emit(task: HourTask | None = None) -> None:
+            snap = throttle.snapshot()
+            if progress:
+                progress.set_throttle(snap.as_dict())
             if not on_progress:
                 return
             done = stats.completed + stats.empty + stats.failed
@@ -198,58 +230,78 @@ class DownloadEngine:
                 "eta_seconds": int((len(tasks) - done) / rate) if rate > 0 else 0,
                 "symbol": task.instrument.symbol if task else None,
                 "symbols": symbol_stats,
+                "throttle": snap.as_dict(),
             })
 
-        with ThreadPoolExecutor(max_workers=self.settings.max_workers) as pool:
-            futures = {pool.submit(self._process, task): task for task in tasks}
+        def submit_until_full(pool: ThreadPoolExecutor) -> None:
+            nonlocal task_index
+            while task_index < len(tasks) and len(pending) < workers:
+                task = tasks[task_index]
+                task_index += 1
+                pending[pool.submit(self._process, task)] = task
+
+        def record_finished(task: HourTask) -> None:
+            sym = task.instrument.symbol
+            bucket = symbol_stats.setdefault(
+                sym, {"completed": 0, "empty": 0, "failed": 0, "ticks": 0},
+            )
+            if task.status is TaskStatus.COMPLETED:
+                stats.completed += 1
+                stats.ticks += task.tick_count
+                bucket["completed"] += 1
+                bucket["ticks"] += task.tick_count
+                if progress:
+                    progress.update(completed=1, ticks=task.tick_count)
+            elif task.status is TaskStatus.EMPTY:
+                stats.empty += 1
+                bucket["empty"] += 1
+                if progress:
+                    progress.update(empty=1)
+            else:
+                stats.failed += 1
+                stats.failed_tasks.append(task)
+                bucket["failed"] += 1
+                if progress:
+                    progress.update(failed=1)
+            emit(task)
+            if on_task_done:
+                on_task_done(task)
+
+        emit()
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            submit_until_full(pool)
             try:
-                for future in as_completed(futures):
+                while pending:
                     if self._should_cancel and self._should_cancel():
-                        for pending in futures:
-                            pending.cancel()
+                        for future in pending:
+                            future.cancel()
                         raise JobCancelled()
-                    task = futures[future]
-                    try:
-                        finished = future.result()
-                        sym = finished.instrument.symbol
-                        bucket = symbol_stats.setdefault(
-                            sym, {"completed": 0, "empty": 0, "failed": 0, "ticks": 0},
-                        )
-                        if finished.status is TaskStatus.COMPLETED:
-                            stats.completed += 1
-                            stats.ticks += finished.tick_count
-                            bucket["completed"] += 1
-                            bucket["ticks"] += finished.tick_count
-                            if progress:
-                                progress.update(completed=1, ticks=finished.tick_count)
-                        else:
-                            stats.empty += 1
-                            bucket["empty"] += 1
-                            if progress:
-                                progress.update(empty=1)
-                        emit(finished)
-                        if on_task_done:
-                            on_task_done(finished)
-                    except JobCancelled:
-                        raise
-                    except Exception as exc:  # noqa: BLE001 - record, never abort the run
-                        task.status = TaskStatus.FAILED
-                        task.error = str(exc)
-                        self.db.mark(task.instrument.id, task.hour, TaskStatus.FAILED,
-                                     error=task.error)
-                        stats.failed += 1
-                        stats.failed_tasks.append(task)
-                        bucket = symbol_stats.setdefault(
-                            task.instrument.symbol,
-                            {"completed": 0, "empty": 0, "failed": 0, "ticks": 0},
-                        )
-                        bucket["failed"] += 1
-                        if progress:
-                            progress.update(failed=1)
-                        emit(task)
-                        if on_task_done:
-                            on_task_done(task)
+                    done, _ = wait(
+                        pending, timeout=0.1, return_when=FIRST_COMPLETED,
+                    )
+                    if not done:
+                        continue
+                    for future in done:
+                        task = pending.pop(future)
+                        try:
+                            record_finished(future.result())
+                        except JobCancelled:
+                            raise
+                        except Exception as exc:  # noqa: BLE001
+                            task.status = TaskStatus.FAILED
+                            task.error = str(exc)
+                            self.db.mark(
+                                task.instrument.id, task.hour, TaskStatus.FAILED,
+                                error=task.error,
+                            )
+                            record_finished(task)
+                    submit_until_full(pool)
+            except JobCancelled:
+                for future in pending:
+                    future.cancel()
+                raise
             finally:
+                self.db.flush()
                 if progress:
                     progress.finish()
         return stats

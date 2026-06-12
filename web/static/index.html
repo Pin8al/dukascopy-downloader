@@ -49,8 +49,9 @@
         </div>
         <div class="grid-2">
           <div class="field">
-            <label for="dl-workers">Workers</label>
-            <input type="number" id="dl-workers" min="1" max="64" value="16">
+            <label for="dl-workers">Concurrency ceiling</label>
+            <input type="number" id="dl-workers" min="4" max="24" value="10">
+            <p class="hint">10 parallel requests is optimal — higher values trigger 503s and slow down.</p>
           </div>
           <div class="field" style="display:flex;align-items:flex-end;padding-bottom:0.15rem">
             <label class="checkbox"><input type="checkbox" id="dl-force"> Force re-download</label>

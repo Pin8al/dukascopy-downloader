@@ -295,6 +295,11 @@ input[type="date"].date-input::-webkit-calendar-picker-indicator:hover {
   flex-wrap: wrap;
 }
 
+.throttle-meta strong {
+  color: var(--text);
+  text-transform: capitalize;
+}
+
 .status-badge {
   display: inline-block;
   padding: 0.15rem 0.5rem;

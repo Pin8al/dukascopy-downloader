@@ -22,14 +22,22 @@ class Settings:
         "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
     )
 
-    # Throughput
-    max_workers: int = 16
-    request_timeout: float = 30.0
+    # Throughput — max_workers is the ceiling; initial_concurrency is where we start.
+    # Bursting straight to 48+ causes Dukascopy 503 storms and *slower* downloads.
+    max_workers: int = 10
+    initial_concurrency: int = 10
+    adaptive_throttle: bool = False
+    process_workers: int = 32  # unused; kept for settings compat
+    request_timeout: float = 15.0
+    throttle_state_path: Path = field(
+        default_factory=lambda: BASE_DIR / "data" / "throttle_state.json",
+    )
+    parquet_compression: str = "snappy"
 
-    # Retry policy
-    max_attempts: int = 5
-    backoff_base_seconds: float = 1.0
-    backoff_max_seconds: float = 60.0
+    # Retry policy (fetch uses fast=True in the download engine)
+    max_attempts: int = 3
+    backoff_base_seconds: float = 0.15
+    backoff_max_seconds: float = 1.5
     # Extra full passes over hours that still failed after per-request retries.
     retry_rounds: int = 2
 

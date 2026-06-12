@@ -17,10 +17,18 @@ class PermanentError(Exception):
 
 
 class RetryManager:
-    def __init__(self, max_attempts: int, base_seconds: float, max_seconds: float):
+    def __init__(
+        self,
+        max_attempts: int,
+        base_seconds: float,
+        max_seconds: float,
+        *,
+        fast: bool = False,
+    ):
         self.max_attempts = max_attempts
         self.base_seconds = base_seconds
         self.max_seconds = max_seconds
+        self.fast = fast
 
     def run(self, fn: Callable[[], T]) -> T:
         attempt = 0
@@ -31,8 +39,13 @@ class RetryManager:
             except RetryableError:
                 if attempt >= self.max_attempts:
                     raise
-                time.sleep(self._backoff(attempt))
+                delay = self._backoff(attempt)
+                if delay > 0:
+                    time.sleep(delay)
 
     def _backoff(self, attempt: int) -> float:
-        delay = min(self.max_seconds, self.base_seconds * (2 ** (attempt - 1)))
+        if self.fast and attempt == 1:
+            return 0.0
+        cap = min(self.max_seconds, 4.0) if self.fast else self.max_seconds
+        delay = min(cap, self.base_seconds * (2 ** (attempt - 1)))
         return delay * (0.5 + random.random())  # jitter: 0.5x .. 1.5x

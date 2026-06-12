@@ -53,7 +53,7 @@ Birdseye must create **less text than the work it improves.** The scan is a blad
 - **The-inverse already landed the path.** If the-inverse fired this turn and named the load-bearing path, birdseye does NOT re-enumerate. Inherit its cutting inverse as the Chosen Path; add only Stance + Process. Never redo the path work the inverse already did.
 - **The-prescription already chose the vehicle.** If the-prescription fired this turn and prescribed a non-trivial artifact or activity, birdseye does NOT re-decide *what* to build — take the vehicle as given and own only the *how* (operator, standard, process). Never re-litigate the cure.
 
-**Tiebreakers:** unsure between "doesn't apply" and B → doesn't apply · unsure between B and C → C · bug with clear cause → doesn't apply, unclear cause → C.
+**Tiebreakers:** unsure between "doesn't apply" and B → doesn't apply · unsure between B and C → C · bug with clear cause → doesn't apply, unclear cause → C. **Any defect turn (bug / error / regression / wrong output) routes to the `the-conviction` skill for the kill itself** — birdseye decides whether/at what depth to engage; the-conviction's evidence ledger then serves as the Process section (never write both).
 
 ---
 
@@ -279,7 +279,7 @@ Memory is bidirectional — read at scan time (Stance lookup), write at decision
 
 ## Sequencing + ambiguity
 
-**Skill order:** the-inverse (question-sharpener) → the-prescription (vehicle-chooser) → **birdseye (process pre-flight)** → domain skills (office-leader, work-file, etc.). Birdseye is a pre-flight, not a competing option: scan → classify → *then* invoke the domain skill with the classification in hand. Never skip the scan because another skill triggered — it handles the role/domain, birdseye handles the thinking process. (Reinforced by the `birdseye-prompt-guard.js` UserPromptSubmit hook.)
+**Skill order:** the-inverse (question-sharpener) → the-prescription (vehicle-chooser) → **birdseye (process pre-flight)** → domain skills (office-leader, work-file, the-conviction for bug-killing, etc.). Beneath the whole chain sits `the-caliber` — the always-on execution floor (read-before-write, verify-before-assert, full-ask fidelity); Step 1.6 operator briefs specialize on top of that floor, never replace it. Birdseye is a pre-flight, not a competing option: scan → classify → *then* invoke the domain skill with the classification in hand. Never skip the scan because another skill triggered — it handles the role/domain, birdseye handles the thinking process. (Reinforced by the `birdseye-prompt-guard.js` UserPromptSubmit hook.)
 
 **Ambiguity:** ask ONE sharp question only when the ambiguity would materially change the chosen path. Otherwise make the best grounded assumption and state it inline. Uncertainty is not a parking brake.
 

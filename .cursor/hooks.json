@@ -5,6 +5,10 @@
       {
         "command": "node .cursor/hooks/birdseye-vision-injector.js",
         "timeout": 30
+      },
+      {
+        "command": "node .cursor/hooks/the-caliber-injector.js",
+        "timeout": 30
       }
     ]
   }

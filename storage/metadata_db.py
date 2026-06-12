@@ -46,6 +46,8 @@ class MetadataDB:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        self._uncommitted = 0
+        self._commit_every = 32
 
     def close(self) -> None:
         with self._lock:
@@ -89,7 +91,16 @@ class MetadataDB:
                 (instrument_id, key, status.value, tick_count, file_path,
                  attempts, error, now),
             )
-            self._conn.commit()
+            self._uncommitted += 1
+            if self._uncommitted >= self._commit_every:
+                self._conn.commit()
+                self._uncommitted = 0
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._uncommitted:
+                self._conn.commit()
+                self._uncommitted = 0
 
     # -- reads -------------------------------------------------------------
 
