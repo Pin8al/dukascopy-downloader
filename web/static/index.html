@@ -40,11 +40,11 @@
         <div class="grid-2">
           <div class="field">
             <label for="dl-start">Start date</label>
-            <input type="date" id="dl-start">
+            <input type="date" class="date-input" id="dl-start" lang="en-CA">
           </div>
           <div class="field">
             <label for="dl-end">End date</label>
-            <input type="date" id="dl-end">
+            <input type="date" class="date-input" id="dl-end" lang="en-CA">
           </div>
         </div>
         <div class="grid-2">
@@ -70,14 +70,17 @@
           <div id="ex-suggestions" class="suggestions"></div>
           <input type="hidden" id="ex-symbol">
         </div>
-        <div class="grid-2">
+        <label class="checkbox" style="margin-bottom:1rem">
+          <input type="checkbox" id="ex-all"> Export entire recorded range (no dates)
+        </label>
+        <div class="grid-2" id="ex-dates">
           <div class="field">
             <label for="ex-start">Start date</label>
-            <input type="date" id="ex-start">
+            <input type="date" class="date-input" id="ex-start" lang="en-CA">
           </div>
           <div class="field">
             <label for="ex-end">End date</label>
-            <input type="date" id="ex-end">
+            <input type="date" class="date-input" id="ex-end" lang="en-CA">
           </div>
         </div>
         <button class="btn btn-primary" id="ex-start-btn">Export CSV</button>
@@ -104,11 +107,11 @@
         <div class="grid-2" id="gp-dates">
           <div class="field">
             <label for="gp-start">Start date</label>
-            <input type="date" id="gp-start">
+            <input type="date" class="date-input" id="gp-start" lang="en-CA">
           </div>
           <div class="field">
             <label for="gp-end">End date</label>
-            <input type="date" id="gp-end">
+            <input type="date" class="date-input" id="gp-end" lang="en-CA">
           </div>
         </div>
         <div class="row">

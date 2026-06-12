@@ -32,15 +32,52 @@ function statusBadge(status) {
   return `<span class="status-badge status-${status}">${status}</span>`;
 }
 
+function formatDateValue(date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
 function defaultDates() {
   const end = new Date();
   end.setDate(end.getDate() - 2);
   const start = new Date(end);
   start.setMonth(start.getMonth() - 1);
   return {
-    start: start.toISOString().slice(0, 10),
-    end: end.toISOString().slice(0, 10),
+    start: formatDateValue(start),
+    end: formatDateValue(end),
   };
+}
+
+function readDateInput(selector, label) {
+  const raw = $(selector).value;
+  if (!raw) {
+    throw new Error(`${label} is required`);
+  }
+  return raw;
+}
+
+function initDateInputs() {
+  const max = formatDateValue(new Date());
+  ["dl-start", "dl-end", "ex-start", "ex-end", "gp-start", "gp-end"].forEach((id, i) => {
+    const el = $(`#${id}`);
+    if (!el) return;
+    el.setAttribute("lang", "en-CA");
+    el.min = "1970-01-01";
+    el.max = max;
+    el.value = i % 2 === 0 ? dates.start : dates.end;
+  });
+}
+
+function formatApiError(data, statusText) {
+  const detail = data?.detail;
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail.map((item) => item.msg || JSON.stringify(item)).join("; ");
+  }
+  if (detail && typeof detail === "object") return JSON.stringify(detail);
+  return data?.error || statusText || "Request failed";
 }
 
 async function api(path, opts = {}) {
@@ -49,7 +86,7 @@ async function api(path, opts = {}) {
     ...opts,
   });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.detail || data.error || res.statusText);
+  if (!res.ok) throw new Error(formatApiError(data, res.statusText));
   return data;
 }
 
@@ -160,22 +197,38 @@ setupSearch(
 // -- dates defaults -----------------------------------------------------------
 
 const dates = defaultDates();
-["dl-start", "dl-end", "ex-start", "ex-end", "gp-start", "gp-end"].forEach((id, i) => {
-  const el = $(`#${id}`);
-  if (el) el.value = i % 2 === 0 ? dates.start : dates.end;
-});
+initDateInputs();
 
-$("#gp-all").addEventListener("change", (e) => {
-  $("#gp-dates").style.opacity = e.target.checked ? "0.4" : "1";
-  $("#gp-dates").style.pointerEvents = e.target.checked ? "none" : "auto";
-});
+function toggleDateFields(checkboxId, datesId) {
+  $(checkboxId).addEventListener("change", (e) => {
+    $(datesId).style.opacity = e.target.checked ? "0.4" : "1";
+    $(datesId).style.pointerEvents = e.target.checked ? "none" : "auto";
+  });
+}
+
+toggleDateFields("#gp-all", "#gp-dates");
+toggleDateFields("#ex-all", "#ex-dates");
 
 // -- job updates ----------------------------------------------------------------
 
 function renderJobProgress(job) {
   const p = job.progress || {};
   const pct = p.percent ?? 0;
-  let html = `
+  let html;
+
+  if (job.kind === "export") {
+    html = `
+    <div class="progress-meta">
+      <span>${p.message || "Exporting"}</span>
+      <span>${pct}%</span>
+    </div>
+    <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
+    <div class="progress-meta">
+      <span>${fmt(p.done)}/${fmt(p.total)} hours scanned · ${fmt(p.hours_with_data)} with data</span>
+      <span>${fmt(p.rows)} ticks written</span>
+    </div>`;
+  } else {
+    html = `
     <div class="progress-meta">
       <span>${p.message || job.kind}</span>
       <span>${pct}%</span>
@@ -185,6 +238,7 @@ function renderJobProgress(job) {
       <span>${fmt(p.done)}/${fmt(p.total)} hours · ok ${fmt(p.completed)} · empty ${fmt(p.empty)} · failed ${fmt(p.failed)}</span>
       <span>${fmt(p.ticks)} ticks · ${p.rate || 0} h/s · ETA ${fmtEta(p.eta_seconds)}</span>
     </div>`;
+  }
 
   if (p.symbols && Object.keys(p.symbols).length) {
     html += `<div class="symbol-grid">${Object.entries(p.symbols)
@@ -197,6 +251,20 @@ function renderJobProgress(job) {
   return html;
 }
 
+function isJobActive(status) {
+  return status === "pending" || status === "running";
+}
+
+async function cancelJob(jobId) {
+  try {
+    await api(`/api/jobs/${jobId}/cancel`, { method: "POST" });
+    toast("Job cancelled");
+    refreshJobs();
+  } catch (e) {
+    toast(e.message);
+  }
+}
+
 function renderJobCard(job) {
   const div = document.createElement("div");
   div.className = "job-card";
@@ -206,8 +274,12 @@ function renderJobCard(job) {
     job.kind === "download"
       ? `Download · ${(params.symbols || []).join(", ")}`
       : job.kind === "export"
-        ? `Export · ${params.symbol}`
+        ? `Export · ${params.symbol}${params.export_all ? " (all recorded)" : ""}`
         : `Gaps · ${params.symbol}`;
+
+  const cancelBtn = isJobActive(job.status)
+    ? `<button type="button" class="job-cancel" data-cancel="${job.id}" aria-label="Cancel job">×</button>`
+    : "";
 
   let body = renderJobProgress(job);
   if (job.status === "completed" && job.result) {
@@ -215,7 +287,8 @@ function renderJobCard(job) {
     if (job.kind === "download") {
       body += `<p class="hint">Done: ${fmt(r.completed)} with data, ${fmt(r.empty)} empty, ${fmt(r.failed)} failed, ${fmt(r.ticks)} ticks.</p>`;
     } else if (job.kind === "export") {
-      body += `<p class="hint">Exported ${fmt(r.rows)} ticks → <a href="/api/exports/file?path=${encodeURIComponent(r.path)}">${r.filename || r.path}</a></p>`;
+      const range = r.range ? `<br>${r.range}` : "";
+      body += `<p class="hint">Exported ${fmt(r.rows)} ticks from ${fmt(r.hours_with_data)} hours${range}<br><a href="/api/exports/file?path=${encodeURIComponent(r.path)}">${r.filename || r.path}</a></p>`;
     } else if (job.kind === "gaps") {
       body += `<p class="hint">${r.complete ? "Dataset complete." : `Gaps: ${r.gap_count ?? r.still_failed ?? "?"}`}</p>`;
     }
@@ -223,8 +296,13 @@ function renderJobCard(job) {
   if (job.status === "failed") {
     body += `<p class="hint" style="color:var(--danger)">${job.error}</p>`;
   }
+  if (job.status === "cancelled") {
+    body += `<p class="hint" style="color:var(--text-muted)">Stopped by user.</p>`;
+  }
 
-  div.innerHTML = `<h3>${title} ${statusBadge(job.status)}</h3>${body}`;
+  div.innerHTML = `<div class="job-head"><h3>${title} ${statusBadge(job.status)}</h3>${cancelBtn}</div>${body}`;
+  const btn = div.querySelector("[data-cancel]");
+  if (btn) btn.addEventListener("click", () => cancelJob(job.id));
   return div;
 }
 
@@ -239,9 +317,10 @@ function renderJobs(jobsArr) {
   const frag = document.createDocumentFragment();
   jobsArr.forEach((job) => {
     const prev = state.jobStatuses.get(job.id);
-    const finished = job.status === "completed" || job.status === "failed";
+    const finished = job.status === "completed" || job.status === "failed" || job.status === "cancelled";
     if (prev && prev !== job.status && finished) {
-      toast(job.status === "completed" ? "Job completed" : "Job failed");
+      if (job.status === "completed") toast("Job completed");
+      else if (job.status === "failed") toast("Job failed");
       loadLibrary();
       loadExports();
     }
@@ -283,10 +362,18 @@ function prependJob(job) {
 $("#dl-start-btn").addEventListener("click", async () => {
   const symbols = [...state.downloadSymbols];
   if (!symbols.length) return toast("Add at least one symbol");
+  let start;
+  let end;
+  try {
+    start = readDateInput("#dl-start", "Start date");
+    end = readDateInput("#dl-end", "End date");
+  } catch (e) {
+    return toast(e.message);
+  }
   const body = {
     symbols,
-    start: $("#dl-start").value,
-    end: $("#dl-end").value,
+    start,
+    end,
     workers: Number($("#dl-workers").value) || 16,
     force: $("#dl-force").checked,
   };
@@ -304,12 +391,19 @@ $("#dl-start-btn").addEventListener("click", async () => {
 $("#ex-start-btn").addEventListener("click", async () => {
   const symbol = $("#ex-symbol").value || $("#ex-search").value.trim();
   if (!symbol) return toast("Select a symbol");
+  const exportAll = $("#ex-all").checked;
+  const body = { symbol, export_all: exportAll };
+  if (!exportAll) {
+    try {
+      body.start = readDateInput("#ex-start", "Start date");
+      body.end = readDateInput("#ex-end", "End date");
+    } catch (e) {
+      return toast(e.message);
+    }
+  }
   try {
-    const job = await api("/api/export", {
-      method: "POST",
-      body: JSON.stringify({ symbol, start: $("#ex-start").value, end: $("#ex-end").value }),
-    });
-    toast("Export started");
+    const job = await api("/api/export", { method: "POST", body: JSON.stringify(body) });
+    toast(exportAll ? "Export all started" : "Export started");
     prependJob(job);
   } catch (e) {
     toast(e.message);
@@ -344,8 +438,12 @@ async function runGapsPreview() {
   const all = $("#gp-all").checked;
   const body = { symbol, all, repair: false };
   if (!all) {
-    body.start = $("#gp-start").value;
-    body.end = $("#gp-end").value;
+    try {
+      body.start = readDateInput("#gp-start", "Start date");
+      body.end = readDateInput("#gp-end", "End date");
+    } catch (e) {
+      return toast(e.message);
+    }
   }
   try {
     const r = await api("/api/gaps/preview", { method: "POST", body: JSON.stringify(body) });
@@ -374,8 +472,12 @@ $("#gp-repair-btn").addEventListener("click", async () => {
   const all = $("#gp-all").checked;
   const body = { symbol, all, repair: true };
   if (!all) {
-    body.start = $("#gp-start").value;
-    body.end = $("#gp-end").value;
+    try {
+      body.start = readDateInput("#gp-start", "Start date");
+      body.end = readDateInput("#gp-end", "End date");
+    } catch (e) {
+      return toast(e.message);
+    }
   }
   try {
     const job = await api("/api/gaps", { method: "POST", body: JSON.stringify(body) });

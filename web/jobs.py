@@ -10,6 +10,7 @@ from collections.abc import Callable
 from typing import Any
 
 from config.settings import Settings
+from core.exceptions import JobCancelled
 from core.services.download_engine import DownloadEngine
 from core.services.gap_scanner import GapScanner
 from core.services.instrument_search import InstrumentCatalog, UnknownInstrumentError
@@ -24,6 +25,7 @@ class JobStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    CANCELLED = "cancelled"
 
 
 @dataclass
@@ -37,6 +39,7 @@ class Job:
     result: dict[str, Any] | None = None
     error: str | None = None
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _cancel: threading.Event = field(default_factory=threading.Event, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         with self._lock:
@@ -72,6 +75,24 @@ class Job:
             self.status = JobStatus.FAILED
             self.error = error
 
+    def request_cancel(self) -> bool:
+        with self._lock:
+            if self.status in (
+                JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED,
+            ):
+                return False
+        self._cancel.set()
+        self.set_progress(message="Cancelling…")
+        return True
+
+    def is_cancelled(self) -> bool:
+        return self._cancel.is_set()
+
+    def mark_cancelled(self) -> None:
+        with self._lock:
+            self.status = JobStatus.CANCELLED
+            self.progress["message"] = "Cancelled"
+
 
 class JobManager:
     def __init__(self) -> None:
@@ -93,13 +114,25 @@ class JobManager:
             self._jobs[job.id] = job
 
         def run() -> None:
+            if job.is_cancelled():
+                job.mark_cancelled()
+                return
             job.set_running()
             try:
                 worker(job)
+            except JobCancelled:
+                job.mark_cancelled()
             except Exception as exc:  # noqa: BLE001
-                job.fail(str(exc))
+                if not job.is_cancelled():
+                    job.fail(str(exc))
 
         threading.Thread(target=run, daemon=True).start()
+        return job
+
+    def cancel(self, job_id: str) -> Job | None:
+        job = self.get(job_id)
+        if job is None or not job.request_cancel():
+            return None
         return job
 
 
@@ -169,7 +202,14 @@ def run_download_job(
     def on_progress(snapshot: dict[str, Any]) -> None:
         job.set_progress(**snapshot, message=f"Downloading {snapshot.get('symbol') or ''}".strip())
 
-    stats = engine.run(all_tasks, quiet=True, on_progress=on_progress)
+    stats = engine.run(
+        all_tasks,
+        quiet=True,
+        on_progress=on_progress,
+        should_cancel=job.is_cancelled,
+    )
+    if job.is_cancelled():
+        raise JobCancelled()
     job.finish({
         "completed": stats.completed,
         "empty": stats.empty,
@@ -188,27 +228,47 @@ def run_export_job(
     store: ParquetStorage,
 ) -> None:
     symbol = job.params["symbol"]
-    start = _parse_date(job.params["start"])
-    end = _parse_date(job.params["end"])
-    if end < start:
-        raise ValueError("end date is before start date")
-
+    export_all = bool(job.params.get("export_all", False))
     instrument = cat.get(symbol)
     planner = Planner(settings, metadata)
-    scanner = GapScanner(settings, metadata)
-    report = scanner.scan(instrument, start, end)
-
-    job.set_progress(message="Exporting ticks", percent=10)
     exporter = MT5CsvExporter(settings, store, planner)
-    result = exporter.export(instrument, start, end)
+    cancel = job.is_cancelled
+    progress = lambda snapshot: job.set_progress(**snapshot)
+
+    if export_all:
+        span = metadata.recorded_span(instrument.id)
+        if span is None:
+            job.finish({"message": "No data recorded yet", "rows": 0, "hours_with_data": 0})
+            return
+        range_label = f"{span[0]:%Y-%m-%d %H:%M} -> {span[1]:%Y-%m-%d %H:%M} UTC (all recorded)"
+        job.set_progress(message=f"Preparing export · {range_label}", percent=0)
+        result = exporter.export_all(
+            instrument, span[0], span[1],
+            on_progress=progress, should_cancel=cancel,
+        )
+    else:
+        start = _parse_date(job.params["start"])
+        end = _parse_date(job.params["end"])
+        if end < start:
+            raise ValueError("end date is before start date")
+        range_label = f"{start} -> {end}"
+        job.set_progress(message=f"Preparing export · {range_label}", percent=0)
+        result = exporter.export(
+            instrument, start, end,
+            on_progress=progress, should_cancel=cancel,
+        )
+
+    if job.is_cancelled():
+        raise JobCancelled()
+
     rel_path = result.path.relative_to(settings.export_dir).as_posix()
     job.finish({
         "path": rel_path,
         "filename": result.path.name,
         "rows": result.rows,
         "hours_with_data": result.hours_with_data,
-        "gaps": len(report.gap_hours),
-        "gap_warning": not report.is_complete,
+        "range": range_label,
+        "all": export_all,
     })
 
 
@@ -282,7 +342,11 @@ def run_gaps_job(
     def on_progress(snapshot: dict[str, Any]) -> None:
         job.set_progress(**snapshot, message="Repairing gaps")
 
-    stats = engine.run(tasks, quiet=True, on_progress=on_progress)
+    stats = engine.run(
+        tasks, quiet=True, on_progress=on_progress, should_cancel=job.is_cancelled,
+    )
+    if job.is_cancelled():
+        raise JobCancelled()
     job.finish({
         "complete": stats.failed == 0,
         "range": range_label,

@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 import requests
 
 from config.settings import Settings
+from core.exceptions import JobCancelled
 from core.models.task import HourTask, TaskStatus
 from core.services.decoder import DecodeError, decode_bi5
 from core.services.progress import ProgressBar
@@ -55,6 +56,7 @@ class DownloadEngine:
             settings.backoff_max_seconds,
         )
         self._thread_local = threading.local()
+        self._should_cancel: Callable[[], bool] | None = None
 
     # -- HTTP ----------------------------------------------------------------
 
@@ -98,6 +100,8 @@ class DownloadEngine:
         return ticks
 
     def _process(self, task: HourTask) -> HourTask:
+        if self._should_cancel and self._should_cancel():
+            raise JobCancelled()
         instrument, hour = task.instrument, task.hour
         if self.storage.has_hour(instrument, hour):
             # File already on disk (e.g. ledger was deleted): trust it.
@@ -128,7 +132,9 @@ class DownloadEngine:
         quiet: bool = False,
         on_progress: Callable[[dict], None] | None = None,
         on_task_done: Callable[[HourTask], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
     ) -> DownloadStats:
+        self._should_cancel = should_cancel
         stats = self._run_pass(
             tasks,
             label="download",
@@ -136,6 +142,8 @@ class DownloadEngine:
             on_progress=on_progress,
             on_task_done=on_task_done,
         )
+        if should_cancel and should_cancel():
+            return stats
         for round_number in range(1, self.settings.retry_rounds + 1):
             if not stats.failed_tasks:
                 break
@@ -196,6 +204,10 @@ class DownloadEngine:
             futures = {pool.submit(self._process, task): task for task in tasks}
             try:
                 for future in as_completed(futures):
+                    if self._should_cancel and self._should_cancel():
+                        for pending in futures:
+                            pending.cancel()
+                        raise JobCancelled()
                     task = futures[future]
                     try:
                         finished = future.result()
@@ -218,6 +230,8 @@ class DownloadEngine:
                         emit(finished)
                         if on_task_done:
                             on_task_done(finished)
+                    except JobCancelled:
+                        raise
                     except Exception as exc:  # noqa: BLE001 - record, never abort the run
                         task.status = TaskStatus.FAILED
                         task.error = str(exc)

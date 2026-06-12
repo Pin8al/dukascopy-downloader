@@ -40,8 +40,9 @@ class DownloadRequest(BaseModel):
 
 class ExportRequest(BaseModel):
     symbol: str
-    start: str
-    end: str
+    start: str | None = None
+    end: str | None = None
+    export_all: bool = False
 
 
 class GapsRequest(BaseModel):
@@ -181,6 +182,14 @@ async def get_job(job_id: str) -> dict[str, Any]:
     return job.to_dict()
 
 
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_job(job_id: str) -> dict[str, Any]:
+    job = jobs.cancel(job_id)
+    if job is None:
+        raise HTTPException(404, "job not found or already finished")
+    return job.to_dict()
+
+
 @app.post("/api/download")
 async def start_download(body: DownloadRequest) -> dict[str, Any]:
     symbols = [s.strip() for s in body.symbols if s.strip()]
@@ -203,6 +212,11 @@ async def start_download(body: DownloadRequest) -> dict[str, Any]:
 
 @app.post("/api/export")
 async def start_export(body: ExportRequest) -> dict[str, Any]:
+    if body.export_all and (body.start or body.end):
+        raise HTTPException(400, "export_all cannot be combined with start/end dates")
+    if not body.export_all and (not body.start or not body.end):
+        raise HTTPException(400, "start and end dates are required unless export_all=true")
+
     try:
         catalog().get(body.symbol)
     except UnknownInstrumentError as exc:

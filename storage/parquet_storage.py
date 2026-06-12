@@ -75,3 +75,42 @@ class ParquetStorage:
             path = self.hour_path(instrument, hour)
             if path.exists():
                 yield hour, pq.read_table(path)
+
+    def list_stored_hours(
+        self,
+        instrument: Instrument,
+        start: datetime | None = None,
+        end: datetime | None = None,
+    ) -> list[datetime]:
+        """Return sorted UTC hours that have a Parquet file on disk."""
+        root = self.data_dir / instrument.symbol
+        if not root.exists():
+            return []
+
+        if start is not None:
+            start = start.astimezone(timezone.utc)
+        if end is not None:
+            end = end.astimezone(timezone.utc)
+
+        hours: list[datetime] = []
+        for path in root.rglob("*.parquet"):
+            try:
+                rel = path.relative_to(root)
+                if len(rel.parts) != 4:
+                    continue
+                hour = datetime(
+                    int(rel.parts[0]),
+                    int(rel.parts[1]),
+                    int(rel.parts[2]),
+                    int(path.stem),
+                    tzinfo=timezone.utc,
+                )
+            except (ValueError, IndexError):
+                continue
+            if start is not None and hour < start:
+                continue
+            if end is not None and hour > end:
+                continue
+            hours.append(hour)
+        hours.sort()
+        return hours
