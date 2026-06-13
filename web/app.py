@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 import shutil
-from datetime import date, datetime
+from contextlib import asynccontextmanager
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +15,9 @@ from pydantic import BaseModel, Field
 from core.exceptions import IncompleteDatasetError
 from core.services.gap_scanner import GapScanner, require_complete_export
 from core.services.instrument_search import UnknownInstrumentError
+from core.services.jetta_metadata import fetch_instrument_info
+from storage.metadata_db import MetadataDB
+from web.automation_runner import describe_automation_dates
 from web.deps import catalog, db, settings, storage
 from web.jobs import (
     JobManager,
@@ -22,11 +26,51 @@ from web.jobs import (
     run_export_job,
     run_gaps_job,
 )
+from web.scheduler import get_scheduler, init_scheduler
+from web.settings_store import settings_store
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 jobs = JobManager()
 
-app = FastAPI(title="Dukascopy Downloader", version="1.0.0")
+
+def _submit_automation_download(params: dict[str, Any]) -> str:
+    symbols = params.get("symbols") or []
+    if not symbols:
+        raise ValueError("no symbols for automation download")
+    cfg = settings()
+    job_params = {
+        "symbols": symbols,
+        "start": params["start"],
+        "end": params["end"],
+        "workers": params.get("workers"),
+        "force": bool(params.get("force", False)),
+        "profile": bool(params.get("profile", False)),
+        "automation_id": params.get("automation_id"),
+        "automation_name": params.get("automation_name"),
+    }
+    job = jobs.submit(
+        "download",
+        job_params,
+        lambda j: run_download_job(j, cfg, catalog(), db(), storage()),
+    )
+    return job.id
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    store = settings_store()
+    sched = init_scheduler(
+        store,
+        submit_download=_submit_automation_download,
+        get_catalog=catalog,
+        get_db=db,
+    )
+    sched.start()
+    yield
+    sched.stop()
+
+
+app = FastAPI(title="Dukascopy Downloader", version="1.0.0", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
@@ -38,6 +82,7 @@ class DownloadRequest(BaseModel):
     end: str
     workers: int | None = None
     force: bool = False
+    profile: bool = False
 
 
 class ExportRequest(BaseModel):
@@ -58,17 +103,118 @@ class GapsRequest(BaseModel):
     refetch_empty: bool = False
 
 
+class UiSettingsUpdate(BaseModel):
+    theme: str | None = None
+    default_workers: int | None = Field(None, ge=1, le=64)
+
+
+class AutomationScheduleModel(BaseModel):
+    type: str = "daily"
+    time: str = "00:00"
+
+
+class AutomationActionModel(BaseModel):
+    type: str = "download"
+    symbols_source: str = "library"
+    symbols: list[str] = Field(default_factory=list)
+    days_ago_start: int = Field(2, ge=0, le=3650)
+    days_ago_end: int = Field(2, ge=0, le=3650)
+    workers: int = Field(15, ge=1, le=64)
+    force: bool = False
+    profile: bool = False
+
+
+class AutomationCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    enabled: bool = True
+    schedule: AutomationScheduleModel = Field(default_factory=AutomationScheduleModel)
+    action: AutomationActionModel = Field(default_factory=AutomationActionModel)
+
+
+class AutomationUpdate(BaseModel):
+    name: str | None = Field(None, min_length=1, max_length=120)
+    enabled: bool | None = None
+    schedule: AutomationScheduleModel | None = None
+    action: AutomationActionModel | None = None
+
+
+def _automation_public(rule: dict[str, Any]) -> dict[str, Any]:
+    out = dict(rule)
+    out["date_preview"] = describe_automation_dates(rule.get("action", {}))
+    return out
+
+
 # -- helpers ------------------------------------------------------------------
 
-def _instrument_payload(inst) -> dict[str, Any]:
+def _latest_downloadable_date(cfg) -> date:
+    lag = timedelta(hours=cfg.min_data_lag_hours)
+    return (datetime.now(timezone.utc) - lag).date()
+
+
+def _instrument_availability(symbol: str) -> dict[str, Any]:
+    cfg = settings()
+    metadata = db()
+    try:
+        inst = catalog().get(symbol)
+    except UnknownInstrumentError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+    jetta = fetch_instrument_info(
+        inst.jetta_code,
+        cfg.base_url,
+        timeout=cfg.request_timeout,
+    )
+    catalog_earliest = (
+        inst.earliest_tick_utc.date().isoformat() if inst.earliest_tick_utc else None
+    )
+    jetta_earliest = jetta.get("tick_from_date")
+    effective_earliest = jetta_earliest or catalog_earliest
+    if catalog_earliest and jetta_earliest:
+        effective_earliest = max(catalog_earliest, jetta_earliest)
+
+    span = metadata.recorded_span(inst.id)
+    summary = metadata.summary(inst.id)
+    latest = _latest_downloadable_date(cfg)
+
     return {
+        "symbol": inst.symbol,
+        "jetta_code": inst.jetta_code,
+        "name": inst.name,
+        "catalog_earliest_date": catalog_earliest,
+        "jetta_earliest_date": jetta_earliest,
+        "effective_earliest_date": effective_earliest,
+        "latest_downloadable_date": latest.isoformat(),
+        "jetta_error": jetta.get("error"),
+        "stored": {
+            "first_hour": summary["first_hour"],
+            "last_hour": summary["last_hour"],
+            "completed_hours": summary["by_status"].get("completed", {}).get("hours", 0),
+            "empty_hours": summary["by_status"].get("empty", {}).get("hours", 0),
+            "ticks": summary["by_status"].get("completed", {}).get("ticks", 0),
+        }
+        if span
+        else None,
+    }
+
+
+def _instrument_payload(inst, metadata=None) -> dict[str, Any]:
+    earliest = inst.earliest_tick_utc.date().isoformat() if inst.earliest_tick_utc else None
+    payload = {
         "id": inst.id,
         "symbol": inst.symbol,
         "name": inst.name,
         "description": inst.description,
         "decimals": inst.price_decimals,
         "earliest": inst.earliest_tick_utc.isoformat() if inst.earliest_tick_utc else None,
+        "earliest_date": earliest,
+        "jetta_code": inst.jetta_code,
     }
+    if metadata is not None:
+        summary = metadata.summary(inst.id)
+        first_hour = summary.get("first_hour")
+        if first_hour:
+            payload["stored_from_date"] = str(first_hour)[:10]
+    return payload
 
 
 def _parse_date(value: str) -> date:
@@ -123,6 +269,14 @@ def _gap_preview_item(symbol: str, range_label: str | None, report) -> dict[str,
 
 # -- pages --------------------------------------------------------------------
 
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> FileResponse:
+    path = STATIC_DIR / "favicon.ico"
+    if not path.is_file():
+        raise HTTPException(404)
+    return FileResponse(path, media_type="image/x-icon")
+
+
 @app.get("/")
 async def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
@@ -135,15 +289,23 @@ async def search_instruments(q: str = Query("", min_length=0), limit: int = 30) 
     if not q.strip():
         return {"results": []}
     results = catalog().search(q)[:limit]
-    return {"results": [_instrument_payload(i) for i in results]}
+    metadata = db()
+    return {"results": [_instrument_payload(i, metadata) for i in results]}
 
 
 @app.get("/api/instruments/{symbol}")
 async def get_instrument(symbol: str) -> dict[str, Any]:
     try:
-        return resolve_symbol(catalog(), symbol)
+        return _instrument_availability(symbol)
+    except HTTPException:
+        raise
     except ValueError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/api/instruments/{symbol}/availability")
+async def instrument_availability(symbol: str) -> dict[str, Any]:
+    return _instrument_availability(symbol)
 
 
 # -- status -------------------------------------------------------------------
@@ -383,3 +545,80 @@ async def preview_gaps(body: GapsRequest) -> dict[str, Any]:
         range_label, report = _gap_report(body, inst, scanner, metadata)
         results.append(_gap_preview_item(inst.symbol, range_label, report))
     return {"results": results, "complete": all(r.get("complete") for r in results)}
+
+
+# -- settings & automations ---------------------------------------------------
+
+@app.get("/api/settings")
+async def get_settings() -> dict[str, Any]:
+    store = settings_store()
+    automations = [_automation_public(r) for r in store.list_automations()]
+    return {"ui": store.get_ui(), "automations": automations}
+
+
+@app.patch("/api/settings/ui")
+async def patch_ui_settings(body: UiSettingsUpdate) -> dict[str, Any]:
+    patch = body.model_dump(exclude_none=True)
+    if "theme" in patch and patch["theme"] not in ("light", "dark"):
+        raise HTTPException(400, "theme must be 'light' or 'dark'")
+    ui = settings_store().set_ui(patch)
+    return {"ui": ui}
+
+
+def _validate_automation_symbols(action: AutomationActionModel) -> None:
+    if action.symbols_source != "custom":
+        return
+    if not action.symbols:
+        raise HTTPException(400, "custom symbol list is empty")
+    for symbol in action.symbols:
+        try:
+            catalog().get(symbol)
+        except UnknownInstrumentError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/api/automations")
+async def create_automation(body: AutomationCreate) -> dict[str, Any]:
+    _validate_automation_symbols(body.action)
+    rule = settings_store().create_automation(body.model_dump())
+    return _automation_public(rule)
+
+
+@app.put("/api/automations/{rule_id}")
+async def update_automation(rule_id: str, body: AutomationUpdate) -> dict[str, Any]:
+    existing = settings_store().get_automation(rule_id)
+    if existing is None:
+        raise HTTPException(404, "automation not found")
+    merged = {
+        "name": body.name if body.name is not None else existing["name"],
+        "enabled": body.enabled if body.enabled is not None else existing["enabled"],
+        "schedule": (body.schedule.model_dump() if body.schedule else existing["schedule"]),
+        "action": (body.action.model_dump() if body.action else existing["action"]),
+    }
+    _validate_automation_symbols(AutomationActionModel(**merged["action"]))
+    rule = settings_store().update_automation(rule_id, merged)
+    if rule is None:
+        raise HTTPException(404, "automation not found")
+    return _automation_public(rule)
+
+
+@app.delete("/api/automations/{rule_id}")
+async def delete_automation(rule_id: str) -> dict[str, Any]:
+    if not settings_store().delete_automation(rule_id):
+        raise HTTPException(404, "automation not found")
+    return {"deleted": rule_id}
+
+
+@app.post("/api/automations/{rule_id}/run")
+async def run_automation_now(rule_id: str) -> dict[str, Any]:
+    sched = get_scheduler()
+    if sched is None:
+        raise HTTPException(503, "scheduler not running")
+    try:
+        return sched.run_now(rule_id)
+    except KeyError as exc:
+        raise HTTPException(404, "automation not found") from exc
+    except UnknownInstrumentError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc

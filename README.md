@@ -1,6 +1,6 @@
 # Dukascopy Tick Downloader
 
-Downloads historical tick data from the free Dukascopy datafeed into local
+Downloads historical tick data from the Dukascopy JETTA API into local
 **Parquet storage** (the source of truth) and exports **MT5-compatible tick
 CSV** files on demand (CSV is only a disposable export format).
 
@@ -52,13 +52,12 @@ python main.py export EURUSD --all
 python main.py status EURUSD
 ```
 
-`download` options: `--workers N` (default 16), `--force` (reprocess
-completed hours).
+`download` options: `--workers N` (default 15, max 64), `--force`, `--profile`
 
 ## How it works
 
 ```
-plan hours -> fetch .bi5 (parallel) -> LZMA decode -> verify -> Parquet (atomic)
+plan hours -> fetch JETTA JSON (parallel) -> decode -> verify -> Parquet (atomic)
                                                                   |
                  SQLite ledger: completed / empty / failed  <-----+
                                                                   |
@@ -71,17 +70,16 @@ plan hours -> fetch .bi5 (parallel) -> LZMA decode -> verify -> Parquet (atomic)
   and empty hours are never re-downloaded, so interrupted runs resume for free
   and progress is never lost.
 - **Retry manager**: exponential backoff with jitter for network errors and
-  5xx responses; corrupt payloads (LZMA/structure/verification failures)
+  5xx responses; corrupt payloads (JSON/structure/verification failures)
   trigger a fresh fetch. Hours that still fail get extra retry rounds, then
   remain flagged for `gaps --repair`. Temporary failures never abort a run.
 - **Planner** clamps ranges to each instrument's earliest available data and
-  skips the not-yet-published most recent hours. Every other hour is fetched
-  from Dukascopy; hours with no data are recorded as empty only after a 404
-  or zero-byte response.
+  skips the not-yet-published most recent hours. Hours with no tick data are
+  recorded as empty after an empty JETTA response.
 - **Verification** checks record structure, timestamp monotonicity and bounds,
   positive prices, and plausible spreads before anything is persisted.
-- **Instrument catalog** (`config/instruments.json`) carries the per-instrument
-  decimal factor needed to decode raw integer prices, plus data start dates.
+- **Instrument catalog** (`config/instruments.json`) carries display names used
+  to resolve JETTA instrument codes, plus data start dates.
 
 ## MT5 CSV format
 

@@ -1,8 +1,8 @@
 """Instrument catalog lookup and fuzzy search.
 
 The catalog (config/instruments.json) is the full Dukascopy instrument
-metadata set, including the per-instrument decimal factor required to
-decode raw bi5 integer prices.
+metadata set, including earliest tick availability and display names used
+to resolve JETTA instrument codes.
 """
 from __future__ import annotations
 

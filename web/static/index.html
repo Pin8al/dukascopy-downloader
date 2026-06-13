@@ -3,18 +3,29 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Dukascopy Downloader</title>
+  <title>Tick Downloader</title>
+  <link rel="icon" href="/favicon.ico" type="image/x-icon">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/sweetalert2@11/dist/sweetalert2.min.css">
   <link rel="stylesheet" href="/static/styles.css">
+  <script>
+    (function () {
+      const t = localStorage.getItem("theme");
+      if (t === "dark") document.documentElement.dataset.theme = "dark";
+    })();
+  </script>
 </head>
 <body>
   <div class="app">
     <header>
-      <div>
-        <h1>Dukascopy Downloader</h1>
-        <p>Parquet storage &middot; MT5 export &middot; gap repair</p>
+      <div class="brand">
+        <img class="brand-logo" src="/static/vectoralgo.png" alt="" width="44" height="44">
+        <div>
+          <h1>Tick Downloader</h1>
+          <p>Historical market ticks · bulk download · MT5 export</p>
+        </div>
       </div>
     </header>
 
@@ -24,37 +35,47 @@
       <button class="tab" data-tab="gaps">Gaps</button>
       <button class="tab" data-tab="library">Library</button>
       <button class="tab" data-tab="jobs">Jobs</button>
+      <button class="tab" data-tab="settings">Settings</button>
     </nav>
 
     <!-- Download -->
     <section id="panel-download" class="panel active">
       <div class="card">
         <h2>Bulk download</h2>
-        <div class="field search-wrap">
+
+        <div class="field">
           <label for="dl-search">Instruments</label>
-          <input type="text" id="dl-search" placeholder="Search symbol or name (e.g. EURUSD, gold)…" autocomplete="off">
-          <div id="dl-suggestions" class="suggestions"></div>
-          <div id="dl-chips" class="chips"></div>
-          <p class="hint">Add multiple symbols to download them together in one job.</p>
+          <div class="combobox" id="dl-combobox">
+            <div class="combobox-input-wrap">
+              <input type="text" id="dl-search" placeholder="Search symbol or name (e.g. EURUSD, silver)…" autocomplete="off" role="combobox" aria-expanded="false" aria-controls="dl-suggestions" aria-autocomplete="list">
+              <div id="dl-suggestions" class="suggestions" role="listbox"></div>
+            </div>
+            <div id="dl-symbols" class="chips"></div>
+          </div>
+          <p class="hint hint-compact">Type to search · <kbd>↑</kbd><kbd>↓</kbd> navigate · <kbd>Enter</kbd> add · add multiple symbols per job</p>
         </div>
+
         <div class="grid-2">
           <div class="field">
-            <label for="dl-start">Start date</label>
-            <input type="date" class="date-input" id="dl-start" lang="en-CA">
+            <label>Start date</label>
+            <div id="dl-start-picker"></div>
           </div>
           <div class="field">
-            <label for="dl-end">End date</label>
-            <input type="date" class="date-input" id="dl-end" lang="en-CA">
+            <label>End date</label>
+            <div id="dl-end-picker"></div>
           </div>
         </div>
+        <p id="dl-range-notice" class="range-notice hidden"></p>
+
         <div class="grid-2">
           <div class="field">
-            <label for="dl-workers">Concurrency ceiling</label>
-            <input type="number" id="dl-workers" min="4" max="24" value="10">
-            <p class="hint">10 parallel requests is optimal — higher values trigger 503s and slow down.</p>
+            <label for="dl-workers">Workers per job</label>
+            <input type="number" id="dl-workers" min="1" max="64" value="15">
+            <p class="hint">15–32 per job is typical. Stack multiple jobs for more throughput.</p>
           </div>
-          <div class="field" style="display:flex;align-items:flex-end;padding-bottom:0.15rem">
+          <div class="field field-checkboxes">
             <label class="checkbox"><input type="checkbox" id="dl-force"> Force re-download</label>
+            <label class="checkbox"><input type="checkbox" id="dl-profile"> Profile timings (live)</label>
           </div>
         </div>
         <button class="btn btn-primary" id="dl-start-btn">Start download</button>
@@ -65,26 +86,31 @@
     <section id="panel-export" class="panel">
       <div class="card">
         <h2>Export to MT5 CSV</h2>
-        <div class="field search-wrap">
+        <div class="field">
           <label for="ex-search">Instrument</label>
-          <input type="text" id="ex-search" placeholder="Symbol…" autocomplete="off">
-          <div id="ex-suggestions" class="suggestions"></div>
+          <div class="combobox" id="ex-combobox">
+            <div class="combobox-input-wrap">
+              <input type="text" id="ex-search" placeholder="Search symbol…" autocomplete="off" role="combobox" aria-expanded="false" aria-controls="ex-suggestions" aria-autocomplete="list">
+              <div id="ex-suggestions" class="suggestions" role="listbox"></div>
+            </div>
+            <div id="ex-availability" class="availability-panel hidden"></div>
+          </div>
           <input type="hidden" id="ex-symbol">
         </div>
-        <label class="checkbox" style="margin-bottom:1rem">
+        <label class="checkbox block-checkbox">
           <input type="checkbox" id="ex-all"> Export entire recorded range (no dates)
         </label>
         <div class="grid-2" id="ex-dates">
           <div class="field">
-            <label for="ex-start">Start date</label>
-            <input type="date" class="date-input" id="ex-start" lang="en-CA">
+            <label>Start date</label>
+            <div id="ex-start-picker"></div>
           </div>
           <div class="field">
-            <label for="ex-end">End date</label>
-            <input type="date" class="date-input" id="ex-end" lang="en-CA">
+            <label>End date</label>
+            <div id="ex-end-picker"></div>
           </div>
         </div>
-        <p class="hint">Export is only allowed when the selected range has no gaps. Run Gaps → Scan &amp; repair first if needed.</p>
+        <p class="hint">Export requires a complete range — run Gaps → repair first if needed.</p>
         <button class="btn btn-primary" id="ex-start-btn">Export CSV</button>
       </div>
       <div class="card">
@@ -97,27 +123,30 @@
     <section id="panel-gaps" class="panel">
       <div class="card">
         <h2>Gap scanner</h2>
-        <div class="field search-wrap">
+        <div class="field">
           <label for="gp-search">Instruments</label>
-          <input type="text" id="gp-search" placeholder="Search symbol or name…" autocomplete="off">
-          <div id="gp-suggestions" class="suggestions"></div>
-          <div id="gp-chips" class="chips"></div>
+          <div class="combobox" id="gp-combobox">
+            <div class="combobox-input-wrap">
+              <input type="text" id="gp-search" placeholder="Search symbol or name…" autocomplete="off" role="combobox" aria-expanded="false" aria-controls="gp-suggestions" aria-autocomplete="list">
+              <div id="gp-suggestions" class="suggestions" role="listbox"></div>
+            </div>
+            <div id="gp-chips" class="chips"></div>
+          </div>
           <div class="row gp-library-row">
             <button type="button" class="btn" id="gp-add-library-btn">Add all from library</button>
           </div>
-          <p class="hint">Add multiple symbols to scan them together.</p>
         </div>
-        <label class="checkbox" style="margin-bottom:1rem">
+        <label class="checkbox block-checkbox">
           <input type="checkbox" id="gp-all"> Scan entire recorded range (no dates)
         </label>
         <div class="grid-2" id="gp-dates">
           <div class="field">
-            <label for="gp-start">Start date</label>
-            <input type="date" class="date-input" id="gp-start" lang="en-CA">
+            <label>Start date</label>
+            <div id="gp-start-picker"></div>
           </div>
           <div class="field">
-            <label for="gp-end">End date</label>
-            <input type="date" class="date-input" id="gp-end" lang="en-CA">
+            <label>End date</label>
+            <div id="gp-end-picker"></div>
           </div>
         </div>
         <div class="row">
@@ -145,9 +174,98 @@
         <div id="jobs-list"><p class="empty">No jobs yet.</p></div>
       </div>
     </section>
+
+    <!-- Settings -->
+    <section id="panel-settings" class="panel">
+      <div class="card">
+        <h2>Appearance</h2>
+        <label class="settings-toggle">
+          <span>
+            <strong>Dark mode</strong>
+            <span class="hint block-hint">Easier on the eyes for long sessions</span>
+          </span>
+          <input type="checkbox" id="set-dark-mode" role="switch">
+        </label>
+      </div>
+
+      <div class="card">
+        <h2>Defaults</h2>
+        <div class="field">
+          <label for="set-default-workers">Default workers per job</label>
+          <input type="number" id="set-default-workers" min="1" max="64" value="15">
+          <p class="hint">Used for new downloads and automations unless overridden.</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Automatic actions</h2>
+        <p class="hint">Schedule recurring downloads. Example: daily at <strong>00:00</strong>, both day offsets <strong>2</strong> → on 14 Jun at midnight, download <strong>12 Jun</strong> for every symbol in your library.</p>
+        <div id="auto-list" class="auto-list"><p class="empty">Loading…</p></div>
+        <button type="button" class="btn" id="auto-add-btn">+ New action</button>
+
+        <div id="auto-editor" class="auto-editor hidden">
+          <h3 id="auto-editor-title">New action</h3>
+          <input type="hidden" id="auto-edit-id">
+          <div class="field">
+            <label for="auto-name">Name</label>
+            <input type="text" id="auto-name" placeholder="e.g. Nightly library catch-up">
+          </div>
+          <label class="checkbox block-checkbox"><input type="checkbox" id="auto-enabled" checked> Enabled</label>
+          <div class="grid-2">
+            <div class="field">
+              <label for="auto-time">Run daily at</label>
+              <input type="time" id="auto-time" class="date-picker-input" value="00:00">
+            </div>
+            <div class="field">
+              <label for="auto-workers">Workers</label>
+              <input type="number" id="auto-workers" min="1" max="64" value="15">
+            </div>
+          </div>
+          <div class="field">
+            <label>Symbols</label>
+            <div class="segmented" role="radiogroup">
+              <label class="segmented-item"><input type="radio" name="auto-symbols-source" value="library" checked> All in library</label>
+              <label class="segmented-item"><input type="radio" name="auto-symbols-source" value="custom"> Custom list</label>
+            </div>
+            <div id="auto-custom-symbols" class="hidden">
+              <div class="combobox" style="margin-top:0.5rem">
+                <div class="combobox-input-wrap">
+                  <input type="text" id="auto-search" placeholder="Search symbol to add…" autocomplete="off">
+                  <div id="auto-suggestions" class="suggestions" role="listbox"></div>
+                </div>
+                <div id="auto-chips" class="chips"></div>
+              </div>
+            </div>
+          </div>
+          <div class="grid-2">
+            <div class="field">
+              <label for="auto-days-start">Older day (days ago)</label>
+              <input type="number" id="auto-days-start" min="0" max="3650" value="2">
+              <p class="hint">2 = day before yesterday</p>
+            </div>
+            <div class="field">
+              <label for="auto-days-end">Newer day (days ago)</label>
+              <input type="number" id="auto-days-end" min="0" max="3650" value="2">
+              <p class="hint">Same as older → single day</p>
+            </div>
+          </div>
+          <p id="auto-date-preview" class="auto-preview"></p>
+          <div class="field auto-options">
+            <label class="checkbox"><input type="checkbox" id="auto-force"> Force re-download</label>
+            <label class="checkbox"><input type="checkbox" id="auto-profile"> Profile timings</label>
+          </div>
+          <div class="row">
+            <button type="button" class="btn btn-primary" id="auto-save-btn">Save action</button>
+            <button type="button" class="btn" id="auto-cancel-btn">Cancel</button>
+          </div>
+        </div>
+      </div>
+    </section>
   </div>
 
-  <div id="toast" class="toast"></div>
+  <script src="https://cdn.jsdelivr.net/npm/sweetalert2@11"></script>
+  <script src="/static/swal.js"></script>
+  <script src="/static/date-picker.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

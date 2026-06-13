@@ -1,7 +1,7 @@
 """Command line interface.
 
     python main.py search <text>
-    python main.py download <SYMBOL> <START> <END> [--workers N] [--force]
+    python main.py download <SYMBOL> <START> <END> [--workers N] [--force] [--profile]
     python main.py export   <SYMBOL> <START> <END>
     python main.py export   <SYMBOL> --all
     python main.py gaps     <SYMBOL> <START> <END> [--repair]
@@ -23,6 +23,7 @@ from core.exceptions import IncompleteDatasetError
 from core.services.gap_scanner import GapScanner, require_complete_export
 from core.services.instrument_search import InstrumentCatalog, UnknownInstrumentError
 from core.services.planner import Planner
+from core.services.profile_format import format_profile_line
 from export.mt5_csv_exporter import MT5CsvExporter
 from storage.metadata_db import MetadataDB, _hour_key
 from storage.parquet_storage import ParquetStorage
@@ -60,6 +61,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_download.add_argument("--force", action="store_true",
                             help="re-process hours even if marked completed/empty")
+    p_download.add_argument(
+        "--profile", action="store_true",
+        help="print per-hour fetch/decode/write timings (ms)",
+    )
 
     p_export = sub.add_parser("export", help="export stored ticks to MT5 tick CSV")
     p_export.add_argument("symbol")
@@ -167,7 +172,23 @@ def cmd_download(settings: Settings, catalog: InstrumentCatalog, args) -> int:
         print("All hours already downloaded. Nothing to do.")
         return 0
 
-    stats = engine.run(plan.tasks, refetch=args.force)
+    if args.profile:
+        print("Profile (ms): fetch = HTTP, decode = JSON+verify, write = Parquet+ledger\n")
+
+    log_lock = threading.Lock()
+
+    def on_task_done(task) -> None:
+        if not args.profile:
+            return
+        with log_lock:
+            print(format_profile_line(task), flush=True)
+
+    stats = engine.run(
+        plan.tasks,
+        refetch=args.force,
+        profile=args.profile,
+        on_task_done=on_task_done if args.profile else None,
+    )
     print(f"\nDone: {stats.completed} hours with data, {stats.empty} empty, "
           f"{stats.failed} failed, {stats.ticks:,} ticks total.")
     if stats.failed:

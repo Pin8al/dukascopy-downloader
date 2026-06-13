@@ -15,23 +15,19 @@ class Settings:
     db_path: Path = field(default_factory=lambda: BASE_DIR / "data" / "metadata.db")
     instruments_file: Path = field(default_factory=lambda: BASE_DIR / "config" / "instruments.json")
 
-    # Dukascopy datafeed
-    base_url: str = "https://datafeed.dukascopy.com/datafeed"
+    # Dukascopy JETTA API (JSON ticks, not rate-limited like the legacy datafeed)
+    base_url: str = "https://jetta.dukascopy.com/v1"
     user_agent: str = (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
     )
 
-    # Throughput — max_workers is the ceiling; initial_concurrency is where we start.
-    # Bursting straight to 48+ causes Dukascopy 503 storms and *slower* downloads.
-    max_workers: int = 10
-    initial_concurrency: int = 10
-    adaptive_throttle: bool = False
+    # Throughput — each worker holds one keep-alive connection to JETTA.
+    # Raise via --workers or the UI; run multiple jobs to multiply total in-flight.
+    max_workers: int = 15
+    max_workers_ceiling: int = 64
     process_workers: int = 32  # unused; kept for settings compat
-    request_timeout: float = 15.0
-    throttle_state_path: Path = field(
-        default_factory=lambda: BASE_DIR / "data" / "throttle_state.json",
-    )
+    request_timeout: float = 30.0
     parquet_compression: str = "snappy"
 
     # Retry policy (fetch uses fast=True in the download engine)
@@ -42,7 +38,7 @@ class Settings:
     retry_rounds: int = 2
 
     # Planning
-    # The most recent hours are not yet published by Dukascopy.
+    # The most recent hours may not yet be published.
     min_data_lag_hours: int = 2
 
     def ensure_directories(self) -> None:
@@ -52,9 +48,6 @@ class Settings:
 
     def for_job(self, workers: int | None = None) -> Settings:
         """Download/gap-repair settings with an optional worker ceiling override."""
-        ceiling = workers or self.max_workers
-        return replace(
-            self,
-            max_workers=ceiling,
-            initial_concurrency=min(self.initial_concurrency, ceiling),
-        )
+        ceiling = workers if workers is not None else self.max_workers
+        ceiling = max(1, min(ceiling, self.max_workers_ceiling))
+        return replace(self, max_workers=ceiling)

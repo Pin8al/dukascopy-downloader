@@ -1,8 +1,8 @@
 """Concurrent download engine.
 
-Each hour: fetch -> decode -> verify -> persist. A tuned concurrency limiter
-keeps HTTP pressure in Dukascopy's sweet spot (bursting to 48+ causes 503
-storms and *slower* effective throughput than ~12–16 workers).
+Each hour: fetch JSON from JETTA -> decode -> verify -> persist. The API is not
+rate-limited like the legacy datafeed, so concurrency is bounded only by
+max_workers and local I/O.
 """
 from __future__ import annotations
 
@@ -13,13 +13,16 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 
 import requests
-from requests.adapters import HTTPAdapter
 
 from config.settings import Settings
 from core.exceptions import JobCancelled
-from core.models.task import HourTask, TaskStatus
-from core.services.adaptive_throttle import AdaptiveThrottle
-from core.services.decoder import DecodeError, decode_bi5_table
+from core.models.task import HourTask, TaskProfile, TaskStatus
+from core.services.decoder import DecodeError, decode_jetta_table
+from core.services.http_client import (
+    loads_json,
+    session_initializer,
+    worker_session,
+)
 from core.services.progress import ProgressBar
 from core.services.retry_manager import PermanentError, RetryableError, RetryManager
 from core.services.verification import verify_table
@@ -27,6 +30,36 @@ from storage.metadata_db import MetadataDB
 from storage.parquet_storage import ParquetStorage
 
 _RETRYABLE_HTTP = {408, 425, 429, 500, 502, 503, 504}
+_PROFILE_RECENT_LIMIT = 80
+
+
+def _profile_entry(task: HourTask) -> dict:
+    profile = task.profile or TaskProfile()
+    return {
+        "symbol": task.instrument.symbol,
+        "hour": task.hour.strftime("%Y-%m-%d %H:00"),
+        "status": task.status.value,
+        "ticks": task.tick_count,
+        **profile.as_dict(),
+    }
+
+
+def _profile_summary(entries: list[dict]) -> dict | None:
+    active = [entry for entry in entries if not entry.get("skipped")]
+    if not active:
+        return None
+    count = len(active)
+
+    def avg(key: str) -> float:
+        return round(sum(entry[key] for entry in active) / count, 1)
+
+    return {
+        "fetch_ms": avg("fetch_ms"),
+        "decode_ms": avg("decode_ms"),
+        "write_ms": avg("write_ms"),
+        "total_ms": avg("total_ms"),
+        "samples": count,
+    }
 
 
 @dataclass
@@ -56,89 +89,107 @@ class DownloadEngine:
             settings.backoff_max_seconds,
             fast=True,
         )
-        self._thread_local = threading.local()
         self._should_cancel: Callable[[], bool] | None = None
-        self._throttle: AdaptiveThrottle | None = None
         self._refetch = False
+        self._profile = False
 
-    def _session(self) -> requests.Session:
-        session = getattr(self._thread_local, "session", None)
-        if session is None:
-            session = requests.Session()
-            session.headers["User-Agent"] = self.settings.user_agent
-            pool = max(self.settings.max_workers, 16)
-            adapter = HTTPAdapter(pool_connections=pool, pool_maxsize=pool)
-            session.mount("https://", adapter)
-            session.mount("http://", adapter)
-            self._thread_local.session = session
-        return session
-
-    def _fetch(self, url: str) -> bytes | None:
-        throttle = self._throttle
-        if throttle is not None:
-            throttle.acquire(self._should_cancel)
-        start = time.monotonic()
+    def _fetch_body(self, url: str) -> tuple[bytes | None, float]:
+        started = time.perf_counter()
         try:
-            response = self._session().get(url, timeout=self.settings.request_timeout)
+            response = worker_session(self.settings).get(
+                url, timeout=self.settings.request_timeout,
+            )
         except requests.RequestException as exc:
             raise RetryableError(f"network error: {exc}") from exc
-        finally:
-            if throttle is not None:
-                throttle.release()
+        fetch_ms = (time.perf_counter() - started) * 1000
 
-        elapsed = time.monotonic() - start
         status = response.status_code
-        if throttle is not None:
-            throttle.record_fetch(status, elapsed)
-
         if status == 200:
-            return response.content
+            return response.content, fetch_ms
         if status == 404:
-            return None
+            return None, fetch_ms
         if status in _RETRYABLE_HTTP:
             raise RetryableError(f"HTTP {status}")
         raise PermanentError(f"HTTP {status}")
 
-    def _fetch_decode_verify(self, task: HourTask):
-        raw = self._fetch(task.url(self.settings.base_url))
-        if raw is None or len(raw) == 0:
-            return None
+    def _fetch_decode_verify(self, task: HourTask) -> tuple[object | None, TaskProfile]:
+        profile = TaskProfile()
+        url = task.tick_url(self.settings.base_url)
+        body, profile.fetch_ms = self._fetch_body(url)
+        if body is None:
+            return None, profile
+
+        decode_started = time.perf_counter()
         try:
-            table = decode_bi5_table(raw, task.hour_start_ms, task.instrument.decimal_factor)
+            payload = loads_json(body)
+            table = decode_jetta_table(
+                payload,
+                task.hour_start_ms,
+                task.hour_end_ms,
+            )
         except DecodeError as exc:
             raise RetryableError(str(exc)) from exc
+        except (ValueError, TypeError) as exc:
+            raise RetryableError(f"invalid JSON from {url}: {exc}") from exc
+
+        if table.num_rows == 0:
+            profile.decode_ms = (time.perf_counter() - decode_started) * 1000
+            return None, profile
+
         check = verify_table(table, task.hour_start_ms)
+        profile.decode_ms = (time.perf_counter() - decode_started) * 1000
         if not check.ok:
             raise RetryableError(f"verification failed: {check.reason}")
-        return table
+        return table, profile
 
     def _process(self, task: HourTask) -> HourTask:
         if self._should_cancel and self._should_cancel():
             raise JobCancelled()
         instrument, hour = task.instrument, task.hour
+        started = time.perf_counter()
         if not self._refetch and self.storage.has_hour(instrument, hour):
             self.db.mark(
                 instrument.id, hour, TaskStatus.COMPLETED,
                 file_path=str(self.storage.hour_path(instrument, hour)),
             )
             task.status = TaskStatus.COMPLETED
+            if self._profile:
+                task.profile = TaskProfile(
+                    skipped=True,
+                    total_ms=(time.perf_counter() - started) * 1000,
+                )
             return task
 
-        table = self.retry.run(lambda: self._fetch_decode_verify(task))
+        profile = TaskProfile()
+
+        def attempt() -> object | None:
+            nonlocal profile
+            table, profile = self._fetch_decode_verify(task)
+            return table
+
+        table = self.retry.run(attempt)
 
         if table is None:
             self.db.mark(instrument.id, hour, TaskStatus.EMPTY)
             task.status = TaskStatus.EMPTY
+            profile.total_ms = (time.perf_counter() - started) * 1000
+            if self._profile:
+                task.profile = profile
             return task
 
+        write_started = time.perf_counter()
         tick_count = table.num_rows
         path = self.storage.write_hour_table(instrument, hour, table)
         self.db.mark(
             instrument.id, hour, TaskStatus.COMPLETED,
             tick_count=tick_count, file_path=str(path),
         )
+        profile.write_ms = (time.perf_counter() - write_started) * 1000
+        profile.total_ms = (time.perf_counter() - started) * 1000
         task.status = TaskStatus.COMPLETED
         task.tick_count = tick_count
+        if self._profile:
+            task.profile = profile
         return task
 
     def run(
@@ -149,15 +200,11 @@ class DownloadEngine:
         on_task_done: Callable[[HourTask], None] | None = None,
         should_cancel: Callable[[], bool] | None = None,
         refetch: bool = False,
+        profile: bool = False,
     ) -> DownloadStats:
         self._should_cancel = should_cancel
         self._refetch = refetch
-        self._throttle = AdaptiveThrottle(
-            self.settings.max_workers,
-            self.settings.throttle_state_path,
-            initial=self.settings.initial_concurrency,
-            enabled=self.settings.adaptive_throttle,
-        )
+        self._profile = profile
         try:
             stats = self._run_pass(
                 tasks, label="download", quiet=quiet,
@@ -185,10 +232,8 @@ class DownloadEngine:
             return stats
         finally:
             self.db.flush()
-            if self._throttle is not None:
-                self._throttle.save()
-                self._throttle = None
             self._refetch = False
+            self._profile = False
 
     def _run_pass(
         self,
@@ -201,41 +246,42 @@ class DownloadEngine:
         stats = DownloadStats()
         if not tasks:
             return stats
-        throttle = self._throttle
-        assert throttle is not None
 
         workers = self.settings.max_workers
-        use_console = not quiet and on_progress is None and on_task_done is None
+        use_console = not quiet and on_progress is None
         progress = ProgressBar(total=len(tasks), label=label) if use_console else None
         started_at = time.monotonic()
         symbol_stats: dict[str, dict[str, int]] = {}
+        profile_recent: list[dict] = []
         task_index = 0
         pending: dict[Future, HourTask] = {}
 
         def emit(task: HourTask | None = None) -> None:
-            snap = throttle.snapshot()
-            if progress:
-                progress.set_throttle(snap.as_dict())
-            if not on_progress:
-                return
-            done = stats.completed + stats.empty + stats.failed
-            elapsed = time.monotonic() - started_at
-            rate = done / elapsed if elapsed > 0 else 0.0
-            on_progress({
+            payload: dict = {
                 "label": label,
                 "total": len(tasks),
-                "done": done,
+                "done": stats.completed + stats.empty + stats.failed,
                 "completed": stats.completed,
                 "empty": stats.empty,
                 "failed": stats.failed,
                 "ticks": stats.ticks,
-                "percent": round(100 * done / len(tasks), 1) if tasks else 100.0,
-                "rate": round(rate, 2),
-                "eta_seconds": int((len(tasks) - done) / rate) if rate > 0 else 0,
+                "percent": round(
+                    100 * (stats.completed + stats.empty + stats.failed) / len(tasks), 1,
+                ) if tasks else 100.0,
                 "symbol": task.instrument.symbol if task else None,
                 "symbols": symbol_stats,
-                "throttle": snap.as_dict(),
-            })
+                "workers": workers,
+            }
+            elapsed = time.monotonic() - started_at
+            rate = payload["done"] / elapsed if elapsed > 0 else 0.0
+            payload["rate"] = round(rate, 2)
+            payload["eta_seconds"] = int((len(tasks) - payload["done"]) / rate) if rate > 0 else 0
+            if self._profile:
+                payload["profile"] = True
+                payload["profile_recent"] = list(profile_recent)
+                payload["profile_summary"] = _profile_summary(profile_recent)
+            if on_progress:
+                on_progress(payload)
 
         def submit_until_full(pool: ThreadPoolExecutor) -> None:
             nonlocal task_index
@@ -267,12 +313,19 @@ class DownloadEngine:
                 bucket["failed"] += 1
                 if progress:
                     progress.update(failed=1)
+            if self._profile:
+                profile_recent.append(_profile_entry(task))
+                if len(profile_recent) > _PROFILE_RECENT_LIMIT:
+                    del profile_recent[:-_PROFILE_RECENT_LIMIT]
             emit(task)
             if on_task_done:
                 on_task_done(task)
 
         emit()
-        with ThreadPoolExecutor(max_workers=workers) as pool:
+        with ThreadPoolExecutor(
+            max_workers=workers,
+            initializer=session_initializer(self.settings),
+        ) as pool:
             submit_until_full(pool)
             try:
                 while pending:

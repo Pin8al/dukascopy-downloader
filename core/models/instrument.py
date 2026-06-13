@@ -21,7 +21,16 @@ class Instrument:
 
     @property
     def feed_code(self) -> str:
-        """Path segment used by the Dukascopy datafeed."""
+        """Legacy alias kept for callers that still refer to feed codes."""
+        return self.id.upper()
+
+    @property
+    def jetta_code(self) -> str:
+        """Instrument code used by the JETTA API (e.g. EUR-USD, 0005.HK-HKD)."""
+        if "/" in self.name:
+            return self.name.replace("/", "-").upper()
+        if len(self.id) == 6:
+            return f"{self.id[:3].upper()}-{self.id[3:].upper()}"
         return self.id.upper()
 
     @property

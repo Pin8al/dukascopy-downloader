@@ -175,6 +175,13 @@ def run_download_job(
             "total_hours": plan.total_hours,
             "to_download": len(plan.tasks),
             "already_done": plan.already_done,
+            "effective_start": plan.effective_start.isoformat() if plan.effective_start else None,
+            "effective_end": plan.effective_end.isoformat() if plan.effective_end else None,
+            "clamped_start": (
+                plan.effective_start.date().isoformat()
+                if plan.effective_start and plan.effective_start.date() > start
+                else None
+            ),
         }
         all_tasks.extend(plan.tasks)
 
@@ -207,6 +214,7 @@ def run_download_job(
         on_progress=on_progress,
         should_cancel=job.is_cancelled,
         refetch=force,
+        profile=bool(job.params.get("profile", False)),
     )
     if job.is_cancelled():
         raise JobCancelled()
