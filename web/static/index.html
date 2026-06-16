@@ -24,14 +24,15 @@
         <img class="brand-logo" src="/static/vectoralgo.png" alt="" width="44" height="44">
         <div>
           <h1>Tick Downloader</h1>
-          <p>Historical market ticks · bulk download · MT5 export</p>
+          <p>Historical Market Ticks · Bulk Download · MetaTrader 5 Import</p>
         </div>
       </div>
     </header>
 
     <nav class="tabs" role="tablist">
       <button class="tab active" data-tab="download">Download</button>
-      <button class="tab" data-tab="export">Export</button>
+      <button class="tab" data-tab="import">Import</button>
+      <button class="tab" data-tab="symbols">Symbols</button>
       <button class="tab" data-tab="gaps">Gaps</button>
       <button class="tab" data-tab="library">Library</button>
       <button class="tab" data-tab="jobs">Jobs</button>
@@ -82,15 +83,15 @@
       </div>
     </section>
 
-    <!-- Export -->
-    <section id="panel-export" class="panel">
+    <!-- Import / Export -->
+    <section id="panel-import" class="panel">
       <div class="card">
-        <h2>Export to MT5 CSV</h2>
+        <h2>Import to MetaTrader 5</h2>
         <div class="field">
           <label for="ex-search">Instrument</label>
           <div class="combobox" id="ex-combobox">
             <div class="combobox-input-wrap">
-              <input type="text" id="ex-search" placeholder="Search symbol…" autocomplete="off" role="combobox" aria-expanded="false" aria-controls="ex-suggestions" aria-autocomplete="list">
+              <input type="text" id="ex-search" placeholder="Search library…" autocomplete="off" role="combobox" aria-expanded="false" aria-controls="ex-suggestions" aria-autocomplete="list">
               <div id="ex-suggestions" class="suggestions" role="listbox"></div>
             </div>
             <div id="ex-availability" class="availability-panel hidden"></div>
@@ -98,7 +99,7 @@
           <input type="hidden" id="ex-symbol">
         </div>
         <label class="checkbox block-checkbox">
-          <input type="checkbox" id="ex-all"> Export entire recorded range (no dates)
+          <input type="checkbox" id="ex-all" checked> <span id="ex-all-label">Import entire recorded range (no dates)</span>
         </label>
         <div class="grid-2" id="ex-dates">
           <div class="field">
@@ -110,12 +111,24 @@
             <div id="ex-end-picker"></div>
           </div>
         </div>
-        <p class="hint">Export requires a complete range — run Gaps → repair first if needed.</p>
-        <button class="btn btn-primary" id="ex-start-btn">Export CSV</button>
+        <p class="hint" id="ex-import-hint">Requires MetaTrader 5 path in Settings. Launches MT5 to import ticks into a custom symbol.</p>
+        <button class="btn btn-primary" id="ex-start-btn">Import to MT5</button>
       </div>
+      <div class="card" id="ex-recent-imports-card">
+        <h2>Recent imports</h2>
+        <div id="import-list"><p class="empty">Imports appear in Jobs when complete.</p></div>
+      </div>
+    </section>
+
+    <!-- MT5 custom symbols -->
+    <section id="panel-symbols" class="panel">
       <div class="card">
-        <h2>Recent exports</h2>
-        <div id="export-list"><p class="empty">Loading…</p></div>
+        <h2>Custom symbols in MT5</h2>
+        <div class="row" style="margin-bottom:1rem">
+          <button type="button" class="btn btn-primary" id="sym-refresh-btn">Refresh from MT5</button>
+        </div>
+        <div id="sym-status" class="hint"></div>
+        <div id="sym-table"><p class="empty">Loading…</p></div>
       </div>
     </section>
 
@@ -194,6 +207,30 @@
           <label for="set-default-workers">Default workers per job</label>
           <input type="number" id="set-default-workers" min="1" max="64" value="15">
           <p class="hint">Used for new downloads and automations unless overridden.</p>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>MetaTrader 5</h2>
+        <div class="field">
+          <label for="set-mt5-terminal">terminal64.exe path</label>
+          <input type="text" id="set-mt5-terminal" placeholder="C:\Program Files\MetaTrader 5\terminal64.exe" spellcheck="false">
+          <p class="hint">Required for Import to MT5. Data folder is auto-detected unless overridden below.</p>
+        </div>
+        <div class="field">
+          <label for="set-mt5-data">Data folder (optional)</label>
+          <input type="text" id="set-mt5-data" placeholder="%APPDATA%\MetaQuotes\Terminal\&lt;instance&gt;" spellcheck="false">
+        </div>
+        <div class="grid-2">
+          <div class="field">
+            <label for="set-mt5-suffix">Custom symbol suffix</label>
+            <input type="text" id="set-mt5-suffix" value=".DUK" maxlength="12">
+            <p class="hint">e.g. EURUSD → EURUSD.DUK</p>
+          </div>
+          <div class="field">
+            <label for="set-mt5-origin">Origin symbol override (optional)</label>
+            <input type="text" id="set-mt5-origin" placeholder="Broker symbol for contract specs">
+          </div>
         </div>
       </div>
 

@@ -6,4 +6,4 @@ class JobCancelled(Exception):
 
 
 class IncompleteDatasetError(Exception):
-    """Raised when export is blocked because the dataset has gaps."""
+    """Raised when import is blocked because the dataset has gaps."""

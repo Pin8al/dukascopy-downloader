@@ -27,6 +27,16 @@ CREATE TABLE IF NOT EXISTS hour_status (
 );
 CREATE INDEX IF NOT EXISTS idx_hour_status_lookup
     ON hour_status (instrument, status);
+CREATE TABLE IF NOT EXISTS mt5_custom_symbol (
+    symbol         TEXT PRIMARY KEY,
+    source_symbol  TEXT NOT NULL DEFAULT '',
+    ticks          INTEGER NOT NULL DEFAULT 0,
+    first_ms       INTEGER NOT NULL DEFAULT 0,
+    last_ms        INTEGER NOT NULL DEFAULT 0,
+    range_label    TEXT,
+    imported_at    TEXT,
+    synced_at      TEXT NOT NULL
+);
 """
 
 # Completed hours are never overwritten with a worse outcome.
@@ -152,6 +162,112 @@ class MetadataDB:
             self._uncommitted = 0
             return cur.rowcount
 
+    def list_completed_hours(
+        self,
+        instrument_id: str,
+        start_hour: datetime,
+        end_hour: datetime,
+    ) -> list[tuple[datetime, int]]:
+        """Completed hours with tick counts, sorted ascending."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT hour_utc, tick_count FROM hour_status
+                WHERE instrument=? AND status=? AND tick_count > 0
+                  AND hour_utc BETWEEN ? AND ?
+                ORDER BY hour_utc
+                """,
+                (
+                    instrument_id,
+                    _COMPLETED,
+                    _hour_key(start_hour),
+                    _hour_key(end_hour),
+                ),
+            ).fetchall()
+        return [
+            (
+                datetime.fromisoformat(hour_utc).replace(tzinfo=timezone.utc),
+                int(tick_count),
+            )
+            for hour_utc, tick_count in rows
+        ]
+
+    def list_completed_sources(
+        self,
+        instrument_id: str,
+        start_hour: datetime,
+        end_hour: datetime,
+    ) -> list[tuple[str, int]]:
+        """Tick file paths and tick counts for completed hours (no filesystem checks)."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT hour_utc, tick_count, file_path FROM hour_status
+                WHERE instrument=? AND status=? AND tick_count > 0
+                  AND hour_utc BETWEEN ? AND ?
+                ORDER BY hour_utc
+                """,
+                (
+                    instrument_id,
+                    _COMPLETED,
+                    _hour_key(start_hour),
+                    _hour_key(end_hour),
+                ),
+            ).fetchall()
+        return [
+            (
+                file_path or "",
+                int(tick_count),
+                hour_utc,
+            )
+            for hour_utc, tick_count, file_path in rows
+        ]
+
+    def sum_completed_ticks(
+        self,
+        instrument_id: str,
+        start_hour: datetime,
+        end_hour: datetime,
+    ) -> int:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT COALESCE(SUM(tick_count), 0) FROM hour_status
+                WHERE instrument=? AND status=? AND tick_count > 0
+                  AND hour_utc BETWEEN ? AND ?
+                """,
+                (
+                    instrument_id,
+                    _COMPLETED,
+                    _hour_key(start_hour),
+                    _hour_key(end_hour),
+                ),
+            ).fetchone()
+        return int(row[0] if row else 0)
+
+    def replace_file_path(self, old_path: str, new_path: str) -> int:
+        """Update ledger rows that reference old_path. Returns rows changed."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE hour_status SET file_path=? WHERE file_path=?",
+                (new_path, old_path),
+            )
+            self._uncommitted += 1
+        return cur.rowcount
+
+    def rewrite_parquet_paths(self) -> int:
+        """Rewrite any remaining .parquet paths in the ledger to .bin."""
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                UPDATE hour_status
+                SET file_path = REPLACE(file_path, '.parquet', '.bin')
+                WHERE file_path LIKE '%.parquet'
+                """,
+            )
+            self._uncommitted += 1
+        return cur.rowcount
+
     def recorded_span(self, instrument_id: str) -> tuple[datetime, datetime] | None:
         """First and last hour recorded in the ledger for this instrument."""
         summary = self.summary(instrument_id)
@@ -160,3 +276,89 @@ class MetadataDB:
         first = datetime.fromisoformat(summary["first_hour"]).replace(tzinfo=timezone.utc)
         last = datetime.fromisoformat(summary["last_hour"]).replace(tzinfo=timezone.utc)
         return first, last
+
+    # -- MT5 custom symbols (cached; refreshed from MT5 on demand) ------------
+
+    @staticmethod
+    def _ms_to_utc_str(ms: int) -> str | None:
+        if ms <= 0:
+            return None
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+    def _mt5_symbol_row(self, row: tuple) -> dict:
+        symbol, source_symbol, ticks, first_ms, last_ms, range_label, imported_at, synced_at = row
+        return {
+            "symbol": symbol,
+            "source_symbol": source_symbol or "",
+            "ticks": int(ticks),
+            "first_ms": int(first_ms),
+            "last_ms": int(last_ms),
+            "first_utc": self._ms_to_utc_str(int(first_ms)),
+            "last_utc": self._ms_to_utc_str(int(last_ms)),
+            "range_label": range_label or "",
+            "imported_at": imported_at,
+            "synced_at": synced_at,
+        }
+
+    def list_mt5_custom_symbols(self) -> list[dict]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT symbol, source_symbol, ticks, first_ms, last_ms,
+                       range_label, imported_at, synced_at
+                FROM mt5_custom_symbol
+                ORDER BY symbol
+                """,
+            ).fetchall()
+        return [self._mt5_symbol_row(r) for r in rows]
+
+    def upsert_mt5_custom_symbol(
+        self,
+        *,
+        symbol: str,
+        source_symbol: str = "",
+        ticks: int = 0,
+        first_ms: int = 0,
+        last_ms: int = 0,
+        range_label: str | None = None,
+        mark_imported: bool = False,
+    ) -> None:
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        with self._lock:
+            existing = self._conn.execute(
+                "SELECT imported_at FROM mt5_custom_symbol WHERE symbol=?",
+                (symbol,),
+            ).fetchone()
+            imported_at = now if mark_imported else (existing[0] if existing else None)
+            self._conn.execute(
+                """
+                INSERT INTO mt5_custom_symbol (
+                    symbol, source_symbol, ticks, first_ms, last_ms,
+                    range_label, imported_at, synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    source_symbol=excluded.source_symbol,
+                    ticks=excluded.ticks,
+                    first_ms=excluded.first_ms,
+                    last_ms=excluded.last_ms,
+                    range_label=COALESCE(excluded.range_label, mt5_custom_symbol.range_label),
+                    imported_at=COALESCE(excluded.imported_at, mt5_custom_symbol.imported_at),
+                    synced_at=excluded.synced_at
+                """,
+                (
+                    symbol,
+                    source_symbol,
+                    ticks,
+                    first_ms,
+                    last_ms,
+                    range_label,
+                    imported_at,
+                    now,
+                ),
+            )
+            self._uncommitted += 1
+
+    def delete_mt5_custom_symbol(self, symbol: str) -> None:
+        with self._lock:
+            self._conn.execute("DELETE FROM mt5_custom_symbol WHERE symbol=?", (symbol,))
+            self._uncommitted += 1

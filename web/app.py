@@ -1,21 +1,24 @@
 """FastAPI web UI for the Dukascopy downloader."""
 from __future__ import annotations
 
-import shutil
+import logging
 from contextlib import asynccontextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from core.exceptions import IncompleteDatasetError
-from core.services.gap_scanner import GapScanner, require_complete_export
+from core.services.gap_scanner import GapScanner, require_complete_import
 from core.services.instrument_search import UnknownInstrumentError
 from core.services.jetta_metadata import fetch_instrument_info
+from export.mt5_importer import kill_mt5_terminal, wait_mt5_exit
+from export.mt5_symbol_manager import delete_custom_symbol, list_custom_symbols
+from storage.fast_delete import release_import_staging_locks
 from storage.metadata_db import MetadataDB
 from web.automation_runner import describe_automation_dates
 from web.deps import catalog, db, settings, storage
@@ -23,11 +26,13 @@ from web.jobs import (
     JobManager,
     resolve_symbol,
     run_download_job,
-    run_export_job,
     run_gaps_job,
+    run_mt5_import_job,
 )
 from web.scheduler import get_scheduler, init_scheduler
 from web.settings_store import settings_store
+
+logger = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 jobs = JobManager()
@@ -85,11 +90,11 @@ class DownloadRequest(BaseModel):
     profile: bool = False
 
 
-class ExportRequest(BaseModel):
+class Mt5ImportRequest(BaseModel):
     symbol: str
     start: str | None = None
     end: str | None = None
-    export_all: bool = False
+    import_all: bool = False
 
 
 class GapsRequest(BaseModel):
@@ -106,6 +111,13 @@ class GapsRequest(BaseModel):
 class UiSettingsUpdate(BaseModel):
     theme: str | None = None
     default_workers: int | None = Field(None, ge=1, le=64)
+
+
+class Mt5SettingsUpdate(BaseModel):
+    terminal_exe: str | None = None
+    data_path: str | None = None
+    custom_suffix: str | None = None
+    origin_symbol: str | None = None
 
 
 class AutomationScheduleModel(BaseModel):
@@ -260,8 +272,8 @@ def _gap_preview_item(symbol: str, range_label: str | None, report) -> dict[str,
         "completed": report.completed,
         "empty": report.empty,
         "failed": len(report.failed_hours),
-        "missing": len(report.missing_hours),
-        "gap_count": len(report.gap_hours),
+        "missing": report.missing_count,
+        "gap_count": report.missing_count + len(report.failed_hours),
         "complete": report.is_complete,
         "gap_hours": [h.strftime("%Y-%m-%d %H:00") for h in report.gap_hours[:20]],
     }
@@ -291,6 +303,44 @@ async def search_instruments(q: str = Query("", min_length=0), limit: int = 30) 
     results = catalog().search(q)[:limit]
     metadata = db()
     return {"results": [_instrument_payload(i, metadata) for i in results]}
+
+
+@app.get("/api/library/search")
+async def search_library(q: str = Query("", min_length=0), limit: int = 30) -> dict[str, Any]:
+    """Search instruments that have stored tick data (library only)."""
+    needle = q.strip().upper()
+    if not needle:
+        return {"results": []}
+    metadata = db()
+    matches: list[tuple[int, dict[str, Any]]] = []
+    for instrument_id in metadata.list_instruments():
+        if metadata.recorded_span(instrument_id) is None:
+            continue
+        try:
+            inst = catalog().get(instrument_id)
+        except UnknownInstrumentError:
+            continue
+        sym = inst.symbol.upper()
+        name = (inst.name or "").upper()
+        if needle not in sym and needle not in name:
+            continue
+        rank = 0 if sym.startswith(needle) else (1 if needle in sym else 2)
+        matches.append((rank, _instrument_payload(inst, metadata)))
+    matches.sort(key=lambda item: (item[0], item[1]["symbol"]))
+    return {"results": [payload for _, payload in matches[:limit]]}
+
+
+def _require_library_symbol(symbol: str, metadata: MetadataDB):
+    try:
+        inst = catalog().get(symbol)
+    except UnknownInstrumentError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    if metadata.recorded_span(inst.id) is None:
+        raise HTTPException(
+            400,
+            f"{inst.symbol} is not in your library — download it first",
+        )
+    return inst
 
 
 @app.get("/api/instruments/{symbol}")
@@ -332,10 +382,9 @@ async def list_status() -> dict[str, Any]:
 
 
 @app.delete("/api/status/{symbol}")
-async def delete_instrument_data(symbol: str) -> dict[str, Any]:
+async def delete_instrument_data(symbol: str, background_tasks: BackgroundTasks) -> dict[str, Any]:
     metadata = db()
     store = storage()
-    cfg = settings()
 
     try:
         inst = catalog().get(symbol)
@@ -350,12 +399,29 @@ async def delete_instrument_data(symbol: str) -> dict[str, Any]:
     if instrument_id not in metadata.list_instruments():
         raise HTTPException(404, f"No stored data for {symbol}")
 
-    store.delete_symbol(symbol_dir)
-    deleted_hours = metadata.delete_instrument(instrument_id)
+    if jobs.has_active_mt5_import():
+        raise HTTPException(409, "Wait for the running MT5 import to finish before deleting library data")
 
-    export_dir = cfg.export_dir / symbol_dir
-    if export_dir.exists():
-        shutil.rmtree(export_dir)
+    mt5_config = settings_store().get_mt5()
+    terminal_exe = str(mt5_config.get("terminal_exe") or "").strip()
+    if terminal_exe:
+        terminal_path = Path(terminal_exe)
+        kill_mt5_terminal(terminal_path)
+        wait_mt5_exit(terminal_path)
+    release_import_staging_locks()
+
+    try:
+        trash_path = store.queue_delete_symbol(symbol_dir)
+    except OSError as exc:
+        logger.exception("Failed to queue delete for %s", symbol_dir)
+        raise HTTPException(
+            500,
+            f"Could not delete {symbol_dir}: {exc}. Close MetaTrader 5 if it is open, then retry.",
+        ) from exc
+
+    deleted_hours = metadata.delete_instrument(instrument_id)
+    if trash_path is not None:
+        background_tasks.add_task(store.finish_delete, trash_path)
 
     return {
         "symbol": symbol_dir,
@@ -382,51 +448,6 @@ async def instrument_status(symbol: str) -> dict[str, Any]:
     }
 
 
-# -- exports list -------------------------------------------------------------
-
-@app.get("/api/exports")
-async def list_exports() -> dict[str, Any]:
-    export_dir = settings().export_dir
-    files = []
-    if export_dir.exists():
-        for path in sorted(export_dir.rglob("*.csv"), reverse=True):
-            rel = path.relative_to(export_dir).as_posix()
-            files.append({
-                "symbol": path.parent.name,
-                "filename": path.name,
-                "path": rel,
-                "size": path.stat().st_size,
-                "modified": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
-            })
-    return {"exports": files[:100]}
-
-
-def _export_file_path(path: str) -> Path:
-    export_dir = settings().export_dir.resolve()
-    target = (export_dir / path).resolve()
-    if not str(target).startswith(str(export_dir)) or not target.is_file():
-        raise HTTPException(404, "export file not found")
-    return target
-
-
-@app.get("/api/exports/file")
-async def download_export(path: str = Query(...)) -> FileResponse:
-    target = _export_file_path(path)
-    return FileResponse(target, filename=target.name, media_type="text/csv")
-
-
-@app.delete("/api/exports/file")
-async def delete_export(path: str = Query(...)) -> dict[str, Any]:
-    target = _export_file_path(path)
-    export_dir = settings().export_dir.resolve()
-    rel = target.relative_to(export_dir).as_posix()
-    target.unlink()
-    parent = target.parent
-    if parent != export_dir and parent.exists() and not any(parent.iterdir()):
-        parent.rmdir()
-    return {"deleted": rel}
-
-
 # -- jobs ---------------------------------------------------------------------
 
 @app.get("/api/jobs")
@@ -444,10 +465,24 @@ async def get_job(job_id: str) -> dict[str, Any]:
 
 @app.post("/api/jobs/{job_id}/cancel")
 async def cancel_job(job_id: str) -> dict[str, Any]:
-    job = jobs.cancel(job_id)
+    job = jobs.get(job_id)
+    mt5_config = None
+    if job is not None and job.kind == "mt5_import":
+        mt5_config = settings_store().get_mt5()
+    job = jobs.cancel(job_id, mt5_config=mt5_config)
     if job is None:
         raise HTTPException(404, "job not found or already finished")
     return job.to_dict()
+
+
+@app.delete("/api/jobs/{job_id}")
+async def dismiss_job(job_id: str) -> dict[str, Any]:
+    if not jobs.remove(job_id):
+        job = jobs.get(job_id)
+        if job is None:
+            raise HTTPException(404, "job not found")
+        raise HTTPException(409, "cannot remove a running job")
+    return {"ok": True, "id": job_id}
 
 
 @app.post("/api/download")
@@ -470,39 +505,112 @@ async def start_download(body: DownloadRequest) -> dict[str, Any]:
     return job.to_dict()
 
 
-@app.post("/api/export")
-async def start_export(body: ExportRequest) -> dict[str, Any]:
-    if body.export_all and (body.start or body.end):
-        raise HTTPException(400, "export_all cannot be combined with start/end dates")
-    if not body.export_all and (not body.start or not body.end):
-        raise HTTPException(400, "start and end dates are required unless export_all=true")
+@app.post("/api/mt5/import")
+async def start_mt5_import(body: Mt5ImportRequest) -> dict[str, Any]:
+    if body.import_all and (body.start or body.end):
+        raise HTTPException(400, "import_all cannot be combined with start/end dates")
+    if not body.import_all and (not body.start or not body.end):
+        raise HTTPException(400, "start and end dates are required unless import_all=true")
 
-    try:
-        inst = catalog().get(body.symbol)
-    except UnknownInstrumentError as exc:
-        raise HTTPException(400, str(exc)) from exc
+    if jobs.has_active_mt5_import():
+        raise HTTPException(409, "An MT5 import is already running")
+
+    store = settings_store()
+    mt5_config = store.get_mt5()
+    if not str(mt5_config.get("terminal_exe") or "").strip():
+        raise HTTPException(400, "Configure MetaTrader 5 path in Settings before importing")
+
+    metadata = db()
+    inst = _require_library_symbol(body.symbol, metadata)
 
     cfg = settings()
-    metadata = db()
     scanner = GapScanner(cfg, metadata)
-    if body.export_all:
-        report, range_label = scanner.scan_for_export(inst, export_all=True)
+    if body.import_all:
+        report, range_label = scanner.scan_for_import(inst, import_all=True)
     else:
         start, end = _parse_date(body.start), _parse_date(body.end)
         if end < start:
             raise HTTPException(400, "end date is before start date")
-        report, range_label = scanner.scan_for_export(inst, start=start, end=end)
+        report, range_label = scanner.scan_for_import(inst, start=start, end=end)
     try:
-        require_complete_export(report, inst.symbol, range_label)
+        require_complete_import(report, inst.symbol, range_label)
     except IncompleteDatasetError as exc:
         raise HTTPException(400, str(exc)) from exc
 
+    job_params = body.model_dump()
+    job_params["range_label"] = range_label
+    job_params["gap_checked"] = True
+
     job = jobs.submit(
-        "export",
-        body.model_dump(),
-        lambda j: run_export_job(j, cfg, catalog(), metadata, storage()),
+        "mt5_import",
+        job_params,
+        lambda j: run_mt5_import_job(j, cfg, catalog(), metadata, storage(), mt5_config),
     )
     return job.to_dict()
+
+
+@app.get("/api/mt5/custom-symbols")
+def api_list_mt5_custom_symbols() -> dict[str, Any]:
+    return {"symbols": db().list_mt5_custom_symbols()}
+
+
+def _guess_source_symbol(custom_name: str, suffix: str) -> str:
+    suffix = suffix.strip()
+    if suffix and not suffix.startswith("."):
+        suffix = "." + suffix
+    if suffix and custom_name.endswith(suffix):
+        return custom_name[: -len(suffix)]
+    return custom_name
+
+
+@app.post("/api/mt5/custom-symbols/refresh")
+def api_refresh_mt5_custom_symbols() -> dict[str, Any]:
+    if jobs.has_active_mt5_import():
+        raise HTTPException(409, "Wait for the running MT5 import to finish before refreshing")
+
+    store = settings_store()
+    mt5_config = store.get_mt5()
+    if not str(mt5_config.get("terminal_exe") or "").strip():
+        raise HTTPException(400, "Configure MetaTrader 5 path in Settings")
+
+    suffix = str(mt5_config.get("custom_suffix") or ".DUK").strip() or ".DUK"
+    try:
+        symbols = list_custom_symbols(mt5_config, settings().data_dir)
+    except Exception as exc:
+        raise HTTPException(500, str(exc)) from exc
+
+    metadata = db()
+    for entry in symbols:
+        metadata.upsert_mt5_custom_symbol(
+            symbol=str(entry["symbol"]),
+            source_symbol=_guess_source_symbol(str(entry["symbol"]), suffix),
+            ticks=int(entry.get("ticks", 0)),
+            first_ms=int(entry.get("first_ms", 0)),
+            last_ms=int(entry.get("last_ms", 0)),
+        )
+    return {"symbols": metadata.list_mt5_custom_symbols()}
+
+
+@app.delete("/api/mt5/custom-symbols/{symbol}")
+def api_delete_mt5_custom_symbol(symbol: str) -> dict[str, Any]:
+    symbol = symbol.strip()
+    if not symbol:
+        raise HTTPException(400, "symbol is required")
+    if jobs.has_active_mt5_import():
+        raise HTTPException(409, "Wait for the running MT5 import to finish before deleting symbols")
+
+    store = settings_store()
+    mt5_config = store.get_mt5()
+    if not str(mt5_config.get("terminal_exe") or "").strip():
+        raise HTTPException(400, "Configure MetaTrader 5 path in Settings")
+
+    try:
+        delete_custom_symbol(mt5_config, settings().data_dir, symbol)
+    except Exception as exc:
+        logger.exception("DELETE /api/mt5/custom-symbols/%s failed", symbol)
+        raise HTTPException(500, str(exc)) from exc
+    db().delete_mt5_custom_symbol(symbol)
+    return {"ok": True, "symbol": symbol}
 
 
 @app.post("/api/gaps")
@@ -553,7 +661,7 @@ async def preview_gaps(body: GapsRequest) -> dict[str, Any]:
 async def get_settings() -> dict[str, Any]:
     store = settings_store()
     automations = [_automation_public(r) for r in store.list_automations()]
-    return {"ui": store.get_ui(), "automations": automations}
+    return {"ui": store.get_ui(), "mt5": store.get_mt5(), "automations": automations}
 
 
 @app.patch("/api/settings/ui")
@@ -563,6 +671,18 @@ async def patch_ui_settings(body: UiSettingsUpdate) -> dict[str, Any]:
         raise HTTPException(400, "theme must be 'light' or 'dark'")
     ui = settings_store().set_ui(patch)
     return {"ui": ui}
+
+
+@app.patch("/api/settings/mt5")
+async def patch_mt5_settings(body: Mt5SettingsUpdate) -> dict[str, Any]:
+    patch = body.model_dump(exclude_none=True)
+    if "custom_suffix" in patch:
+        suffix = str(patch["custom_suffix"]).strip()
+        if suffix and not suffix.startswith("."):
+            suffix = "." + suffix
+        patch["custom_suffix"] = suffix
+    mt5 = settings_store().set_mt5(patch)
+    return {"mt5": mt5}
 
 
 def _validate_automation_symbols(action: AutomationActionModel) -> None:

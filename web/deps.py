@@ -4,12 +4,12 @@ from __future__ import annotations
 from config.settings import Settings
 from core.services.instrument_search import InstrumentCatalog
 from storage.metadata_db import MetadataDB
-from storage.parquet_storage import ParquetStorage
+from storage.tick_storage import TickStorage
 
 _settings: Settings | None = None
 _catalog: InstrumentCatalog | None = None
 _db: MetadataDB | None = None
-_storage: ParquetStorage | None = None
+_storage: TickStorage | None = None
 
 
 def settings() -> Settings:
@@ -34,9 +34,9 @@ def db() -> MetadataDB:
     return _db
 
 
-def storage() -> ParquetStorage:
+def storage() -> TickStorage:
     global _storage
     if _storage is None:
         s = settings()
-        _storage = ParquetStorage(s.data_dir, compression=s.parquet_compression)
+        _storage = TickStorage(s.data_dir)
     return _storage

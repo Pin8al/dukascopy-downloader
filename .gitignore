@@ -1,9 +1,5 @@
-# Downloaded tick data (Parquet) + SQLite ledger (metadata.db, -wal, -shm)
+# Downloaded tick data (.bin hour files) + SQLite ledger (metadata.db, -wal, -shm)
 data/
-
-# Generated MT5 CSV exports
-exports/
-
 # Python
 __pycache__/
 *.py[cod]
@@ -13,6 +9,10 @@ dist/
 build/
 .venv/
 venv/
+
+# Launcher state (installer)
+.dukascopy/
+.dukascopy.local.ps1
 
 # Local / editor
 .env

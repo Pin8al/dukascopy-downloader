@@ -968,6 +968,10 @@ th {
   margin-bottom: 0.85rem;
 }
 
+.ex-mode-switch {
+  margin-bottom: 1rem;
+}
+
 .segmented {
   display: flex;
   gap: 0.35rem;

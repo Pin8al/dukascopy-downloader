@@ -2,11 +2,10 @@
 
     python main.py search <text>
     python main.py download <SYMBOL> <START> <END> [--workers N] [--force] [--profile]
-    python main.py export   <SYMBOL> <START> <END>
-    python main.py export   <SYMBOL> --all
     python main.py gaps     <SYMBOL> <START> <END> [--repair]
     python main.py gaps     <SYMBOL> --all [--repair]
     python main.py status   <SYMBOL>
+    python main.py migrate  [--dry-run] [--keep-parquet]
     python main.py web      [--host HOST] [--port PORT]
 """
 from __future__ import annotations
@@ -19,14 +18,12 @@ from datetime import date, datetime
 from config.settings import Settings
 from core.models.task import TaskStatus
 from core.services.download_engine import DownloadEngine
-from core.exceptions import IncompleteDatasetError
-from core.services.gap_scanner import GapScanner, require_complete_export
+from core.services.gap_scanner import GapScanner
 from core.services.instrument_search import InstrumentCatalog, UnknownInstrumentError
 from core.services.planner import Planner
 from core.services.profile_format import format_profile_line
-from export.mt5_csv_exporter import MT5CsvExporter
 from storage.metadata_db import MetadataDB, _hour_key
-from storage.parquet_storage import ParquetStorage
+from storage.tick_storage import TickStorage
 
 
 def _parse_date(value: str) -> date:
@@ -41,7 +38,7 @@ def _parse_date(value: str) -> date:
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="dukascopy-downloader",
-        description="Download Dukascopy tick data into Parquet and export MT5 CSVs.",
+        description="Download Dukascopy tick data into MT5-ready binary files and import to MT5.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -53,7 +50,7 @@ def _build_parser() -> argparse.ArgumentParser:
         p.add_argument("start", type=_parse_date, help="start date YYYY-MM-DD (inclusive)")
         p.add_argument("end", type=_parse_date, help="end date YYYY-MM-DD (inclusive)")
 
-    p_download = sub.add_parser("download", help="download ticks into Parquet storage")
+    p_download = sub.add_parser("download", help="download ticks into binary tick storage")
     add_range_args(p_download)
     p_download.add_argument(
         "--workers", type=int, default=None,
@@ -64,26 +61,6 @@ def _build_parser() -> argparse.ArgumentParser:
     p_download.add_argument(
         "--profile", action="store_true",
         help="print per-hour fetch/decode/write timings (ms)",
-    )
-
-    p_export = sub.add_parser("export", help="export stored ticks to MT5 tick CSV")
-    p_export.add_argument("symbol")
-    p_export.add_argument(
-        "start",
-        nargs="?",
-        type=_parse_date,
-        help="start date YYYY-MM-DD (required unless --all)",
-    )
-    p_export.add_argument(
-        "end",
-        nargs="?",
-        type=_parse_date,
-        help="end date YYYY-MM-DD (required unless --all)",
-    )
-    p_export.add_argument(
-        "--all",
-        action="store_true",
-        help="export the full recorded range for this symbol (no start/end dates)",
     )
 
     p_gaps = sub.add_parser("gaps", help="report (and optionally repair) missing hours")
@@ -119,6 +96,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p_status = sub.add_parser("status", help="show stored data summary for an instrument")
     p_status.add_argument("symbol")
 
+    p_migrate = sub.add_parser(
+        "migrate",
+        help="convert legacy .parquet files to .bin (one-time after upgrading)",
+    )
+    p_migrate.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="list files that would be converted",
+    )
+    p_migrate.add_argument(
+        "--keep-parquet",
+        action="store_true",
+        help="keep .parquet files after conversion",
+    )
+
     p_web = sub.add_parser("web", help="start the web UI")
     p_web.add_argument("--host", default="127.0.0.1")
     p_web.add_argument("--port", type=int, default=8080)
@@ -153,7 +145,7 @@ def cmd_download(settings: Settings, catalog: InstrumentCatalog, args) -> int:
     local_settings = settings.for_job(args.workers)
 
     db = MetadataDB(settings.db_path)
-    storage = ParquetStorage(settings.data_dir, compression=settings.parquet_compression)
+    storage = TickStorage(settings.data_dir)
     planner = Planner(local_settings, db)
     engine = DownloadEngine(local_settings, storage, db)
 
@@ -173,7 +165,7 @@ def cmd_download(settings: Settings, catalog: InstrumentCatalog, args) -> int:
         return 0
 
     if args.profile:
-        print("Profile (ms): fetch = HTTP, decode = JSON+verify, write = Parquet+ledger\n")
+        print("Profile (ms): fetch = HTTP, decode = JSON+verify, write = binary+ledger\n")
 
     log_lock = threading.Lock()
 
@@ -195,49 +187,6 @@ def cmd_download(settings: Settings, catalog: InstrumentCatalog, args) -> int:
         print("Some hours kept failing; run later:\n"
               f"  python main.py gaps {instrument.symbol} {args.start} {args.end} --repair")
         return 1
-    return 0
-
-
-def cmd_export(settings: Settings, catalog: InstrumentCatalog, args) -> int:
-    instrument = catalog.get(args.symbol)
-    if args.all and (args.start or args.end):
-        raise SystemExit("error: --all cannot be combined with start/end dates")
-    if not args.all and (args.start is None or args.end is None):
-        raise SystemExit("error: start and end dates are required (or use --all)")
-
-    db = MetadataDB(settings.db_path)
-    storage = ParquetStorage(settings.data_dir, compression=settings.parquet_compression)
-    planner = Planner(settings, db)
-    scanner = GapScanner(settings, db)
-    exporter = MT5CsvExporter(settings, storage, planner)
-
-    if args.all:
-        report, range_label = scanner.scan_for_export(instrument, export_all=True)
-        if report is None:
-            print(f"No data recorded for {instrument.symbol} yet.")
-            return 0
-        span = db.recorded_span(instrument.id)
-        try:
-            require_complete_export(report, instrument.symbol, range_label)
-        except IncompleteDatasetError as exc:
-            print(f"error: {exc}")
-            return 1
-        result = exporter.export_all(instrument, span[0], span[1])
-    else:
-        _validate_range(args.start, args.end)
-        report, range_label = scanner.scan_for_export(
-            instrument, start=args.start, end=args.end,
-        )
-        try:
-            require_complete_export(report, instrument.symbol, range_label)
-        except IncompleteDatasetError as exc:
-            print(f"error: {exc}")
-            return 1
-        result = exporter.export(instrument, args.start, args.end)
-
-    print(f"Exporting {instrument.symbol} {range_label}")
-    print(f"Exported {result.rows:,} ticks from {result.hours_with_data} hours")
-    print(f"  -> {result.path}")
     return 0
 
 
@@ -289,7 +238,7 @@ def cmd_gaps(settings: Settings, catalog: InstrumentCatalog, args) -> int:
         return 1
 
     local_settings = settings.for_job(args.workers)
-    storage = ParquetStorage(settings.data_dir, compression=settings.parquet_compression)
+    storage = TickStorage(settings.data_dir)
     engine = DownloadEngine(local_settings, storage, db)
     tasks = scanner.build_repair_tasks(instrument, report, refetch_empty=args.refetch_empty)
     parts = []
@@ -352,8 +301,43 @@ def _resolve_web_port(host: str, port: int) -> int:
     )
 
 
+def cmd_migrate(settings: Settings, args) -> int:
+    from storage.parquet_migration import migrate_parquet_to_bin
+
+    try:
+        stats = migrate_parquet_to_bin(
+            settings.data_dir,
+            settings.db_path,
+            dry_run=args.dry_run,
+            delete_parquet=not args.keep_parquet,
+        )
+    except ImportError:
+        print("error: pyarrow is required. Run: pip install pyarrow", file=sys.stderr)
+        return 2
+
+    label = "would convert" if args.dry_run else "converted"
+    if stats["found"] > 0:
+        print(
+            f"\n{label} {stats['converted']} file(s), "
+            f"skipped {stats['skipped']}, "
+            f"deleted {stats['deleted']} parquet, "
+            f"{stats['ticks']:,} ticks, "
+            f"{stats['paths_updated']} ledger path(s) updated",
+        )
+    else:
+        print("No .parquet files found — nothing to migrate.")
+    return 0
+
+
 def cmd_web(args) -> int:
+    import logging
+
     import uvicorn
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s %(name)s: %(message)s",
+    )
 
     port = _resolve_web_port(args.host, args.port)
     print(f"Web UI: http://{args.host}:{port}")
@@ -395,12 +379,12 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_search(catalog, args)
         if args.command == "download":
             return cmd_download(settings, catalog, args)
-        if args.command == "export":
-            return cmd_export(settings, catalog, args)
         if args.command == "gaps":
             return cmd_gaps(settings, catalog, args)
         if args.command == "status":
             return cmd_status(settings, catalog, args)
+        if args.command == "migrate":
+            return cmd_migrate(settings, args)
         if args.command == "web":
             return cmd_web(args)
     except UnknownInstrumentError as exc:

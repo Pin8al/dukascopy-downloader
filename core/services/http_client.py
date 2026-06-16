@@ -35,19 +35,23 @@ def _build_session(settings: Settings) -> requests.Session:
 
 
 def session_initializer(settings: Settings) -> Callable[[], None]:
-    """Per-pool initializer — safe when multiple download jobs run concurrently."""
-    warmup_url = f"{settings.base_url.rstrip('/')}/instruments/EUR-USD"
+    """Per-pool initializer — one keep-alive session per worker, no network I/O."""
 
     def _init() -> None:
-        session = _build_session(settings)
-        _thread_local.session = session
-        try:
-            response = session.get(warmup_url, timeout=settings.request_timeout)
-            response.content  # release socket back to the keep-alive pool
-        except requests.RequestException:
-            pass
+        _thread_local.session = _build_session(settings)
 
     return _init
+
+
+def warmup_session(settings: Settings) -> None:
+    """Optional single connection warmup (call once before a download batch)."""
+    try:
+        url = f"{settings.base_url.rstrip('/')}/instruments/EUR-USD"
+        session = _build_session(settings)
+        response = session.get(url, timeout=min(10.0, settings.request_timeout))
+        response.close()
+    except requests.RequestException:
+        pass
 
 
 def worker_session(settings: Settings) -> requests.Session:

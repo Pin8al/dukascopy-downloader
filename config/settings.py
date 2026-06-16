@@ -11,7 +11,6 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 class Settings:
     # Paths
     data_dir: Path = field(default_factory=lambda: BASE_DIR / "data")
-    export_dir: Path = field(default_factory=lambda: BASE_DIR / "exports")
     db_path: Path = field(default_factory=lambda: BASE_DIR / "data" / "metadata.db")
     instruments_file: Path = field(default_factory=lambda: BASE_DIR / "config" / "instruments.json")
 
@@ -28,7 +27,6 @@ class Settings:
     max_workers_ceiling: int = 64
     process_workers: int = 32  # unused; kept for settings compat
     request_timeout: float = 30.0
-    parquet_compression: str = "snappy"
 
     # Retry policy (fetch uses fast=True in the download engine)
     max_attempts: int = 3
@@ -43,7 +41,6 @@ class Settings:
 
     def ensure_directories(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.export_dir.mkdir(parents=True, exist_ok=True)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
     def for_job(self, workers: int | None = None) -> Settings:

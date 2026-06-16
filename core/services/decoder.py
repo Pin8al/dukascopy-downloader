@@ -1,4 +1,4 @@
-"""Decode Dukascopy JETTA JSON tick payloads into columnar tables.
+"""Decode Dukascopy JETTA JSON tick payloads into columnar batches.
 
 JETTA returns delta-encoded tick history per hour chunk:
     base timestamp, bid, ask + parallel arrays:
@@ -9,9 +9,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-import pyarrow as pa
-
-from storage.parquet_storage import TICK_SCHEMA
+from core.models.tick_batch import TickBatch
 
 
 class DecodeError(Exception):
@@ -29,19 +27,15 @@ def _apply_delta(base: float, delta: float, multiplier: float, precision: float)
     return round((base + delta * multiplier) * precision) / precision
 
 
-def _empty_table() -> pa.Table:
-    return pa.table({name: [] for name in TICK_SCHEMA.names}, schema=TICK_SCHEMA)
-
-
-def decode_jetta_table(
+def decode_jetta_batch(
     payload: dict[str, Any],
     hour_start_ms: int,
     hour_end_ms: int,
-) -> pa.Table:
+) -> TickBatch:
     """Expand JETTA delta arrays and keep ticks inside [hour_start_ms, hour_end_ms)."""
     times = payload.get("times") or []
     if not times:
-        return _empty_table()
+        return TickBatch.empty()
 
     bids = payload.get("bids") or []
     asks = payload.get("asks") or []
@@ -57,33 +51,17 @@ def decode_jetta_table(
     bid = float(payload.get("bid") or 0)
     ask = float(payload.get("ask") or 0)
 
-    ts_out: list[int] = []
-    bids_out: list[float] = []
-    asks_out: list[float] = []
-    bid_vols_out: list[float] = []
-    ask_vols_out: list[float] = []
+    batch = TickBatch()
 
     for index in range(length):
         time_ms += int(times[index])
         bid = _apply_delta(bid, float(bids[index]), multiplier, precision)
         ask = _apply_delta(ask, float(asks[index]), multiplier, precision)
         if hour_start_ms <= time_ms < hour_end_ms:
-            ts_out.append(time_ms)
-            bids_out.append(bid)
-            asks_out.append(ask)
-            bid_vols_out.append(float(bid_volumes[index]))
-            ask_vols_out.append(float(ask_volumes[index]))
+            batch.timestamp_ms.append(time_ms)
+            batch.bid.append(bid)
+            batch.ask.append(ask)
+            batch.bid_volume.append(float(bid_volumes[index]))
+            batch.ask_volume.append(float(ask_volumes[index]))
 
-    if not ts_out:
-        return _empty_table()
-
-    return pa.table(
-        {
-            "timestamp_ms": ts_out,
-            "bid": bids_out,
-            "ask": asks_out,
-            "bid_volume": bid_vols_out,
-            "ask_volume": ask_vols_out,
-        },
-        schema=TICK_SCHEMA,
-    )
+    return batch

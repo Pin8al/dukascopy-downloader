@@ -16,6 +16,13 @@ DEFAULT_UI = {
     "default_workers": 15,
 }
 
+DEFAULT_MT5 = {
+    "terminal_exe": "",
+    "data_path": "",
+    "custom_suffix": ".DUK",
+    "origin_symbol": "",
+}
+
 DEFAULT_AUTOMATION_ACTION = {
     "type": "download",
     "symbols_source": "library",
@@ -32,7 +39,11 @@ class SettingsStore:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._lock = threading.Lock()
-        self._data: dict[str, Any] = {"ui": dict(DEFAULT_UI), "automations": []}
+        self._data: dict[str, Any] = {
+            "ui": dict(DEFAULT_UI),
+            "mt5": dict(DEFAULT_MT5),
+            "automations": [],
+        }
         self._load()
 
     def _load(self) -> None:
@@ -42,6 +53,10 @@ class SettingsStore:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
             if isinstance(raw.get("ui"), dict):
                 self._data["ui"] = {**DEFAULT_UI, **raw["ui"]}
+            if isinstance(raw.get("mt5"), dict):
+                mt5 = {**DEFAULT_MT5, **raw["mt5"]}
+                mt5.pop("shutdown_terminal", None)
+                self._data["mt5"] = mt5
             if isinstance(raw.get("automations"), list):
                 self._data["automations"] = raw["automations"]
         except (json.JSONDecodeError, OSError):
@@ -62,6 +77,18 @@ class SettingsStore:
             self._data["ui"] = {**self._data["ui"], **patch}
             self._save()
             return dict(self._data["ui"])
+
+    def get_mt5(self) -> dict[str, Any]:
+        with self._lock:
+            return dict(self._data["mt5"])
+
+    def set_mt5(self, patch: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            patch = {k: v for k, v in patch.items() if k != "shutdown_terminal"}
+            self._data["mt5"] = {**self._data["mt5"], **patch}
+            self._data["mt5"].pop("shutdown_terminal", None)
+            self._save()
+            return dict(self._data["mt5"])
 
     def list_automations(self) -> list[dict[str, Any]]:
         with self._lock:

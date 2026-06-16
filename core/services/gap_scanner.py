@@ -13,10 +13,11 @@ from config.settings import Settings
 from core.exceptions import IncompleteDatasetError
 from core.models.instrument import Instrument
 from core.models.task import HourTask, TaskStatus
-from core.services.planner import Planner, trading_hours
+from core.services.planner import Planner, _fx_session_break
 from storage.metadata_db import MetadataDB, _hour_key
 
 _HOUR = timedelta(hours=1)
+_GAP_SAMPLE_LIMIT = 32
 
 
 @dataclass
@@ -25,6 +26,7 @@ class GapReport:
     total_hours: int = 0
     completed: int = 0
     empty: int = 0
+    missing_count: int = 0
     failed_hours: list[datetime] = field(default_factory=list)
     missing_hours: list[datetime] = field(default_factory=list)
     empty_hours: list[datetime] = field(default_factory=list)
@@ -42,7 +44,7 @@ class GapReport:
 
     @property
     def is_complete(self) -> bool:
-        return not self.gap_hours
+        return self.missing_count == 0 and not self.failed_hours
 
 
 class GapScanner:
@@ -60,13 +62,37 @@ class GapScanner:
         span = self.db.recorded_span(instrument.id)
         if span is None:
             return None
-        start_hour, end_hour = span
-        hours = []
+        return self._scan_span(instrument, span[0], span[1])
+
+    def _scan_span(
+        self,
+        instrument: Instrument,
+        start_hour: datetime,
+        end_hour: datetime,
+    ) -> GapReport:
+        report = GapReport(instrument_id=instrument.id)
+        recorded = self.db.status_map(instrument.id, start_hour, end_hour)
         cursor = start_hour
         while cursor <= end_hour:
-            hours.append(cursor)
+            if not instrument.continuous_trading and _fx_session_break(cursor):
+                cursor += _HOUR
+                continue
+            report.total_hours += 1
+            status = recorded.get(_hour_key(cursor))
+            if status == TaskStatus.COMPLETED.value:
+                report.completed += 1
+            elif status == TaskStatus.EMPTY.value:
+                report.empty += 1
+                if len(report.empty_hours) < _GAP_SAMPLE_LIMIT:
+                    report.empty_hours.append(cursor)
+            elif status == TaskStatus.FAILED.value:
+                report.failed_hours.append(cursor)
+            else:
+                report.missing_count += 1
+                if len(report.missing_hours) < _GAP_SAMPLE_LIMIT:
+                    report.missing_hours.append(cursor)
             cursor += _HOUR
-        return self._scan_hours(instrument, trading_hours(instrument, hours))
+        return report
 
     def _scan_hours(self, instrument: Instrument, hours: list[datetime]) -> GapReport:
         report = GapReport(instrument_id=instrument.id)
@@ -81,11 +107,14 @@ class GapScanner:
                 report.completed += 1
             elif status == TaskStatus.EMPTY.value:
                 report.empty += 1
-                report.empty_hours.append(hour)
+                if len(report.empty_hours) < _GAP_SAMPLE_LIMIT:
+                    report.empty_hours.append(hour)
             elif status == TaskStatus.FAILED.value:
                 report.failed_hours.append(hour)
             else:
-                report.missing_hours.append(hour)
+                report.missing_count += 1
+                if len(report.missing_hours) < _GAP_SAMPLE_LIMIT:
+                    report.missing_hours.append(hour)
         return report
 
     def build_repair_tasks(
@@ -99,15 +128,15 @@ class GapScanner:
             for hour in report.repair_hours(refetch_empty=refetch_empty)
         ]
 
-    def scan_for_export(
+    def scan_for_import(
         self,
         instrument: Instrument,
         *,
-        export_all: bool = False,
+        import_all: bool = False,
         start: date | None = None,
         end: date | None = None,
     ) -> tuple[GapReport | None, str]:
-        if export_all:
+        if import_all:
             span = self.db.recorded_span(instrument.id)
             if span is None:
                 return None, ""
@@ -122,7 +151,7 @@ class GapScanner:
         return report, f"{start} -> {end}"
 
 
-def require_complete_export(
+def require_complete_import(
     report: GapReport | None,
     symbol: str,
     range_label: str,
@@ -130,9 +159,9 @@ def require_complete_export(
     if report is None:
         raise IncompleteDatasetError(f"No data recorded for {symbol} yet.")
     if not report.is_complete:
-        missing = len(report.missing_hours)
+        missing = report.missing_count
         failed = len(report.failed_hours)
         raise IncompleteDatasetError(
-            f"{symbol}: {len(report.gap_hours)} hour(s) not complete in {range_label} "
+            f"{symbol}: {missing + failed} hour(s) not complete in {range_label} "
             f"({missing} missing, {failed} failed). Run gaps --repair first."
         )

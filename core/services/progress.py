@@ -58,12 +58,14 @@ def _terminal_width() -> int:
 class ProgressBar:
     BAR_WIDTH = 24
 
-    def __init__(self, total: int, label: str = "download"):
+    def __init__(self, total: int, label: str = "download", *, style: str = "download"):
         self.total = total
         self.label = label
+        self.style = style
         self.completed = 0
         self.empty = 0
         self.failed = 0
+        self.deleted = 0
         self.ticks = 0
         self._started_at = time.monotonic()
         self._last_render = 0.0
@@ -88,10 +90,18 @@ class ProgressBar:
         if snapshot.get("rate_limit_hits"):
             self._throttle_text += f" ·{snapshot['rate_limit_hits']}×429"
 
-    def update(self, completed: int = 0, empty: int = 0, failed: int = 0, ticks: int = 0) -> None:
+    def update(
+        self,
+        completed: int = 0,
+        empty: int = 0,
+        failed: int = 0,
+        deleted: int = 0,
+        ticks: int = 0,
+    ) -> None:
         self.completed += completed
         self.empty += empty
         self.failed += failed
+        self.deleted += deleted
         self.ticks += ticks
 
         now = time.monotonic()
@@ -125,11 +135,18 @@ class ProgressBar:
         rate_text = f"{rate:.1f}/s" if rate else "..."
 
         label = f"[{self.label}] " if self.label != "download" else ""
-        stats = (
-            f"{fraction:3.0%} {self.done}/{self.total} "
-            f"ok{self.completed} e{self.empty} f{self.failed} "
-            f"{_format_ticks(self.ticks)} {rate_text}"
-        )
+        if self.style == "migrate":
+            stats = (
+                f"{fraction:3.0%} {self.done}/{self.total} "
+                f"conv{self.completed} skip{self.empty} del{self.deleted} "
+                f"{_format_ticks(self.ticks)} {rate_text}"
+            )
+        else:
+            stats = (
+                f"{fraction:3.0%} {self.done}/{self.total} "
+                f"ok{self.completed} e{self.empty} f{self.failed} "
+                f"{_format_ticks(self.ticks)} {rate_text}"
+            )
 
         throttle = f" {self._throttle_text}" if self._throttle_text else ""
         eta_part = f" ETA {eta}"
@@ -176,11 +193,18 @@ class ProgressBar:
         self._prev_lines = max(1, (len(line) + width - 1) // width)
 
     def _stats_text(self) -> str:
-        text = (
-            f"{self.done}/{self.total} h | "
-            f"ok {self.completed}  empty {self.empty}  failed {self.failed} | "
-            f"{self.ticks:,} ticks"
-        )
+        if self.style == "migrate":
+            text = (
+                f"{self.done}/{self.total} files | "
+                f"conv {self.completed}  skip {self.empty}  del {self.deleted} | "
+                f"{self.ticks:,} ticks"
+            )
+        else:
+            text = (
+                f"{self.done}/{self.total} h | "
+                f"ok {self.completed}  empty {self.empty}  failed {self.failed} | "
+                f"{self.ticks:,} ticks"
+            )
         if self.label != "download":
             text = f"[{self.label}] {text}"
         return text

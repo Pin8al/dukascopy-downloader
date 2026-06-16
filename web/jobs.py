@@ -4,7 +4,7 @@ from __future__ import annotations
 import threading
 import uuid
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from enum import Enum
 from collections.abc import Callable
 from typing import Any
@@ -13,12 +13,12 @@ from config.settings import Settings
 from core.exceptions import JobCancelled
 from core.services.download_engine import DownloadEngine
 from core.exceptions import IncompleteDatasetError
-from core.services.gap_scanner import GapScanner, require_complete_export
+from core.services.gap_scanner import GapScanner, require_complete_import
 from core.services.instrument_search import InstrumentCatalog, UnknownInstrumentError
 from core.services.planner import Planner
-from export.mt5_csv_exporter import MT5CsvExporter
+from export.mt5_importer import abort_mt5_import, stage_and_import
 from storage.metadata_db import MetadataDB
-from storage.parquet_storage import ParquetStorage
+from storage.tick_storage import TickStorage
 
 
 class JobStatus(str, Enum):
@@ -70,6 +70,13 @@ class Job:
             self.status = JobStatus.COMPLETED
             self.result = result
             self.progress["percent"] = 100
+            if result:
+                if "ticks_imported" in result:
+                    self.progress["ticks_imported"] = result["ticks_imported"]
+                if "ticks_total" in result:
+                    self.progress["ticks_total"] = result["ticks_total"]
+                if result.get("custom_symbol"):
+                    self.progress["custom_symbol"] = result["custom_symbol"]
 
     def fail(self, error: str) -> None:
         with self._lock:
@@ -134,15 +141,45 @@ class JobManager:
         threading.Thread(target=run, daemon=True).start()
         return job
 
-    def cancel(self, job_id: str) -> Job | None:
+    def cancel(self, job_id: str, mt5_config: dict[str, Any] | None = None) -> Job | None:
         job = self.get(job_id)
         if job is None or not job.request_cancel():
             return None
+        if job.kind == "mt5_import":
+            abort_mt5_import(job_id, mt5_config)
         return job
+
+    def remove(self, job_id: str) -> bool:
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return False
+            if job.status in (JobStatus.PENDING, JobStatus.RUNNING):
+                return False
+            del self._jobs[job_id]
+            return True
+
+    def has_active_mt5_import(self) -> bool:
+        with self._lock:
+            for job in self._jobs.values():
+                if job.kind != "mt5_import":
+                    continue
+                if job.status not in (JobStatus.PENDING, JobStatus.RUNNING):
+                    continue
+                if job.is_cancelled():
+                    continue
+                return True
+        return False
 
 
 def _parse_date(value: str) -> date:
     return datetime.strptime(value, "%Y-%m-%d").date()
+
+
+def _import_span_ms(span_start: date, span_end: date) -> tuple[int, int]:
+    first = datetime(span_start.year, span_start.month, span_start.day, tzinfo=timezone.utc)
+    last = datetime(span_end.year, span_end.month, span_end.day, 23, 59, 59, tzinfo=timezone.utc)
+    return int(first.timestamp() * 1000), int(last.timestamp() * 1000)
 
 
 def run_download_job(
@@ -150,7 +187,7 @@ def run_download_job(
     settings: Settings,
     cat: InstrumentCatalog,
     metadata: MetadataDB,
-    store: ParquetStorage,
+    store: TickStorage,
 ) -> None:
     symbols = job.params["symbols"]
     start = _parse_date(job.params["start"])
@@ -168,8 +205,17 @@ def run_download_job(
 
     all_tasks = []
     plans: dict[str, dict[str, Any]] = {}
-    for symbol in symbols:
+    symbol_count = len(symbols)
+    job.set_progress(message="Planning download…", phase="plan", percent=0)
+
+    for index, symbol in enumerate(symbols):
         instrument = cat.get(symbol)
+        job.set_progress(
+            message=f"Planning {instrument.symbol}…",
+            phase="plan",
+            percent=round(100 * index / symbol_count, 1) if symbol_count else 0,
+            symbol=instrument.symbol,
+        )
         plan = planner.plan(instrument, start, end, force=force)
         plans[instrument.symbol] = {
             "total_hours": plan.total_hours,
@@ -187,6 +233,7 @@ def run_download_job(
 
     job.set_progress(
         message="Planning complete",
+        phase="download",
         symbols=list(plans.keys()),
         plans=plans,
         total=len(all_tasks),
@@ -206,7 +253,12 @@ def run_download_job(
         return
 
     def on_progress(snapshot: dict[str, Any]) -> None:
-        job.set_progress(**snapshot, message=f"Downloading {snapshot.get('symbol') or ''}".strip())
+        sym = snapshot.get("symbol") or ""
+        job.set_progress(
+            **snapshot,
+            phase="download",
+            message=f"Downloading {sym}".strip() or "Downloading…",
+        )
 
     stats = engine.run(
         all_tasks,
@@ -228,67 +280,103 @@ def run_download_job(
     })
 
 
-def run_export_job(
+def run_mt5_import_job(
     job: Job,
     settings: Settings,
     cat: InstrumentCatalog,
     metadata: MetadataDB,
-    store: ParquetStorage,
+    store: TickStorage,
+    mt5_config: dict[str, Any],
 ) -> None:
     symbol = job.params["symbol"]
-    export_all = bool(job.params.get("export_all", False))
+    import_all = bool(job.params.get("import_all", False))
     instrument = cat.get(symbol)
-    scanner = GapScanner(settings, metadata)
     planner = Planner(settings, metadata)
-    exporter = MT5CsvExporter(settings, store, planner)
     cancel = job.is_cancelled
     progress = lambda snapshot: job.set_progress(**snapshot)
 
-    if export_all:
-        report, range_label = scanner.scan_for_export(instrument, export_all=True)
-        if report is None:
-            job.finish({"message": "No data recorded yet", "rows": 0, "hours_with_data": 0})
-            return
-        try:
-            require_complete_export(report, instrument.symbol, range_label)
-        except IncompleteDatasetError as exc:
-            raise ValueError(str(exc)) from exc
-        span = metadata.recorded_span(instrument.id)
-        job.set_progress(message=f"Preparing export · {range_label}", percent=0)
-        result = exporter.export_all(
-            instrument, span[0], span[1],
-            on_progress=progress, should_cancel=cancel,
-        )
+    job.set_progress(message="Preparing import…", percent=0, phase="prepare")
+
+    span_start: date | None = None
+    span_end: date | None = None
+    range_label = str(job.params.get("range_label") or "")
+
+    if job.params.get("gap_checked") and range_label:
+        if import_all:
+            span = metadata.recorded_span(instrument.id)
+            if span is None:
+                job.finish({"message": "No data recorded yet", "ticks_imported": 0})
+                return
+            span_start = span[0].date()
+            span_end = span[1].date()
+        else:
+            span_start = _parse_date(job.params["start"])
+            span_end = _parse_date(job.params["end"])
     else:
-        start = _parse_date(job.params["start"])
-        end = _parse_date(job.params["end"])
-        if end < start:
-            raise ValueError("end date is before start date")
-        report, range_label = scanner.scan_for_export(
-            instrument, start=start, end=end,
-        )
-        try:
-            require_complete_export(report, instrument.symbol, range_label)
-        except IncompleteDatasetError as exc:
-            raise ValueError(str(exc)) from exc
-        job.set_progress(message=f"Preparing export · {range_label}", percent=0)
-        result = exporter.export(
-            instrument, start, end,
-            on_progress=progress, should_cancel=cancel,
-        )
+        scanner = GapScanner(settings, metadata)
+        if import_all:
+            report, range_label = scanner.scan_for_import(instrument, import_all=True)
+            if report is None:
+                job.finish({"message": "No data recorded yet", "ticks_imported": 0})
+                return
+            try:
+                require_complete_import(report, instrument.symbol, range_label)
+            except IncompleteDatasetError as exc:
+                raise ValueError(str(exc)) from exc
+            span = metadata.recorded_span(instrument.id)
+            if span is None:
+                raise ValueError("No recorded span for instrument")
+            span_start = span[0].date()
+            span_end = span[1].date()
+        else:
+            span_start = _parse_date(job.params["start"])
+            span_end = _parse_date(job.params["end"])
+            if span_end < span_start:
+                raise ValueError("end date is before start date")
+            report, range_label = scanner.scan_for_import(
+                instrument, start=span_start, end=span_end,
+            )
+            try:
+                require_complete_import(report, instrument.symbol, range_label)
+            except IncompleteDatasetError as exc:
+                raise ValueError(str(exc)) from exc
+
+    job.set_progress(message=f"Preparing import · {range_label}", percent=0, phase="prepare")
+
+    result = stage_and_import(
+        settings,
+        store,
+        planner,
+        instrument,
+        job_id=job.id,
+        mt5_raw=mt5_config,
+        import_all=import_all,
+        start=span_start,
+        end=span_end,
+        range_label=range_label,
+        metadata=metadata,
+        on_progress=progress,
+        should_cancel=cancel,
+    )
 
     if job.is_cancelled():
+        abort_mt5_import(job.id, mt5_config, settings=settings)
         raise JobCancelled()
 
-    rel_path = result.path.relative_to(settings.export_dir).as_posix()
-    job.finish({
-        "path": rel_path,
-        "filename": result.path.name,
-        "rows": result.rows,
-        "hours_with_data": result.hours_with_data,
-        "range": range_label,
-        "all": export_all,
-    })
+    job.finish(result)
+
+    custom = result.get("custom_symbol")
+    if custom and span_start is not None and span_end is not None:
+        first_ms, last_ms = _import_span_ms(span_start, span_end)
+        metadata.upsert_mt5_custom_symbol(
+            symbol=str(custom),
+            source_symbol=symbol,
+            ticks=int(result.get("ticks_imported", 0)),
+            first_ms=first_ms,
+            last_ms=last_ms,
+            range_label=str(result.get("range") or ""),
+            mark_imported=True,
+        )
 
 
 def run_gaps_job(
@@ -296,7 +384,7 @@ def run_gaps_job(
     settings: Settings,
     cat: InstrumentCatalog,
     metadata: MetadataDB,
-    store: ParquetStorage,
+    store: TickStorage,
 ) -> None:
     symbols = job.params.get("symbols") or []
     if not symbols and job.params.get("symbol"):

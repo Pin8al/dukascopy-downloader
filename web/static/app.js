@@ -5,6 +5,7 @@ const state = {
   downloadSymbols: new Set(),
   downloadAvailability: new Map(),
   searchCache: new Map(),
+  librarySymbols: new Set(),
   gapSymbols: new Set(),
   autoSymbols: new Set(),
   automations: [],
@@ -119,9 +120,10 @@ async function api(path, opts = {}) {
 // -- tabs ---------------------------------------------------------------------
 
 const TAB_STORAGE_KEY = "activeTab";
-const VALID_TABS = new Set(["download", "export", "gaps", "library", "jobs", "settings"]);
+const VALID_TABS = new Set(["download", "import", "symbols", "gaps", "library", "jobs", "settings"]);
 
 function switchTab(tabName, { save = true } = {}) {
+  if (tabName === "export") tabName = "import";
   if (!VALID_TABS.has(tabName)) tabName = "download";
   $$(".tab").forEach((t) => t.classList.remove("active"));
   $$(".panel").forEach((p) => p.classList.remove("active"));
@@ -130,7 +132,11 @@ function switchTab(tabName, { save = true } = {}) {
   tab.classList.add("active");
   $(`#panel-${tabName}`).classList.add("active");
   if (tabName === "library") loadLibrary();
-  if (tabName === "export") loadExports();
+  if (tabName === "symbols") loadCustomSymbols();
+  if (tabName === "import") {
+    refreshLibrarySymbols();
+    loadImports();
+  }
   if (tabName === "jobs") loadJobs();
   if (tabName === "settings") loadSettings();
   if (save) localStorage.setItem(TAB_STORAGE_KEY, tabName);
@@ -164,7 +170,10 @@ function renderExportSymbol(info) {
     panel.innerHTML = "";
     return;
   }
-  const from = earliestFromInfo(info);
+  const from =
+    info.stored?.first_hour?.slice(0, 10) ||
+    info.stored_from_date ||
+    earliestFromInfo(info);
   const fromBadge = from
     ? `<span class="suggestion-meta">from ${from}</span>`
     : "";
@@ -268,7 +277,13 @@ async function fetchAvailability(symbol) {
 }
 
 function setupSearch(inputId, suggestionsId, onPick, options = {}) {
-  const { single = false, onResultsChange = null, formatBadge = formatEarliestBadge } = options;
+  const {
+    single = false,
+    onResultsChange = null,
+    formatBadge = formatEarliestBadge,
+    searchUrl = "/api/instruments/search",
+    emptyMessage = "No matches",
+  } = options;
   const input = $(inputId);
   const box = $(suggestionsId);
   let timer = null;
@@ -288,7 +303,7 @@ function setupSearch(inputId, suggestionsId, onPick, options = {}) {
 
   function renderSuggestions() {
     if (!results.length) {
-      box.innerHTML = `<div class="suggestion suggestion-empty"><span>No matches</span></div>`;
+      box.innerHTML = `<div class="suggestion suggestion-empty"><span>${emptyMessage}</span></div>`;
       open();
       return;
     }
@@ -332,7 +347,7 @@ function setupSearch(inputId, suggestionsId, onPick, options = {}) {
     timer = setTimeout(async () => {
       try {
         const { results: found } = await api(
-          `/api/instruments/search?q=${encodeURIComponent(q)}&limit=12`,
+          `${searchUrl}?q=${encodeURIComponent(q)}&limit=12`,
         );
         results = found;
         found.forEach((r) => state.searchCache.set(r.symbol, r));
@@ -394,7 +409,7 @@ async function refreshExportAvailability(symbol) {
 
 setupSearch("#dl-search", "#dl-suggestions", (symbol, result) => {
   addDownloadSymbol(symbol, result);
-});
+}, { formatBadge: formatStoredBadge });
 
 setupSearch(
   "#ex-search",
@@ -404,8 +419,22 @@ setupSearch(
     $("#ex-search").value = symbol;
     refreshExportAvailability(symbol);
   },
-  { single: true },
+  {
+    single: true,
+    formatBadge: formatStoredBadge,
+    searchUrl: "/api/library/search",
+    emptyMessage: "No library matches — download the symbol first",
+  },
 );
+
+async function refreshLibrarySymbols() {
+  try {
+    const { instruments } = await api("/api/status");
+    state.librarySymbols = new Set((instruments || []).map((i) => i.symbol));
+  } catch {
+    state.librarySymbols = new Set();
+  }
+}
 
 function renderGapChips() {
   const wrap = $("#gp-chips");
@@ -448,6 +477,7 @@ function toggleDateFields(checkboxId, datesId) {
 
 toggleDateFields("#gp-all", "#gp-dates");
 toggleDateFields("#ex-all", "#ex-dates");
+$("#ex-all").dispatchEvent(new Event("change"));
 
 // -- job updates ----------------------------------------------------------------
 
@@ -479,16 +509,50 @@ function renderJobProgress(job) {
   const pct = p.percent ?? 0;
   let html;
 
-  if (job.kind === "export") {
+  if (job.kind === "mt5_import") {
+    const r = job.status === "completed" && job.result ? job.result : null;
+    const symName = r?.custom_symbol || p.custom_symbol;
+    const sym = symName ? `<span class="muted">→ ${symName}</span>` : "";
+    const imported = r?.ticks_imported ?? p.ticks_imported ?? 0;
+    const total = r?.ticks_total ?? p.ticks_total ?? 0;
+    const displayPct = job.status === "completed" ? 100 : pct;
+    const phaseLabel =
+      p.phase === "prepare"
+        ? "Preparing import"
+        : p.phase === "install"
+          ? "Installing script"
+          : p.phase === "launch"
+            ? "Launching MT5"
+            : p.phase === "warm_m30"
+              ? "Warming M30 cache"
+              : "MT5 import";
+    const hourDetail =
+      (p.phase === "prepare" || p.phase === "import_ticks") && (p.files_total || p.total)
+        ? ` · ${fmt(p.files_done ?? p.done ?? 0)}/${fmt(p.files_total ?? p.total)} hour file(s)`
+        : "";
+    const tickLine =
+      job.status === "completed"
+        ? `${fmt(imported)} ticks in MT5${total && total !== imported ? ` (${fmt(total)} in source)` : ""}`
+        : p.phase === "import_ticks" && p.files_total
+          ? `${fmt(p.files_done ?? 0)} / ${fmt(p.files_total)} hour files`
+          : total
+            ? `${fmt(imported)} / ${fmt(total)} ticks`
+            : `${fmt(imported)} ticks`;
+    const headline =
+      job.status === "completed" && symName
+        ? `Imported ${fmt(imported)} ticks ${sym}`
+        : p.phase === "warm_m30"
+          ? `Warming M30 cache ${sym}`
+          : `${p.message || "Importing to MT5"} ${sym}`;
     html = `
     <div class="progress-meta">
-      <span>${p.message || "Exporting"}</span>
-      <span>${pct}%</span>
+      <span>${headline}</span>
+      <span>${Number(displayPct).toFixed(p.phase === "prepare" ? 1 : 0)}%</span>
     </div>
-    <div class="progress-bar"><div class="progress-fill" style="width:${pct}%"></div></div>
+    <div class="progress-bar"><div class="progress-fill" style="width:${Math.min(100, displayPct)}%"></div></div>
     <div class="progress-meta">
-      <span>${fmt(p.done)}/${fmt(p.total)} hours scanned · ${fmt(p.hours_with_data)} with data</span>
-      <span>${fmt(p.rows)} ticks written</span>
+      <span>${phaseLabel}${hourDetail}</span>
+      <span>${tickLine}</span>
     </div>`;
   } else {
     html = `
@@ -547,6 +611,22 @@ async function cancelJob(jobId) {
   }
 }
 
+async function dismissJob(jobId) {
+  try {
+    await api(`/api/jobs/${jobId}`, { method: "DELETE" });
+    const card = $(`#job-${jobId}`);
+    if (card) card.remove();
+    state.jobStatuses.delete(jobId);
+    const list = $("#jobs-list");
+    if (list && !list.querySelector(".job-card")) {
+      list.innerHTML = '<p class="empty">No jobs yet.</p>';
+    }
+    loadImports();
+  } catch (e) {
+    toastError(e.message);
+  }
+}
+
 function renderJobCard(job) {
   const div = document.createElement("div");
   div.className = "job-card";
@@ -555,22 +635,26 @@ function renderJobCard(job) {
   const title =
     job.kind === "download"
       ? `Download · ${(params.symbols || []).join(", ")}`
-      : job.kind === "export"
-        ? `Export · ${params.symbol}${params.export_all ? " (all recorded)" : ""}`
+      : job.kind === "mt5_import"
+        ? `MT5 import · ${params.symbol}${params.import_all ? " (all recorded)" : ""}`
         : `Gaps · ${(params.symbols || (params.symbol ? [params.symbol] : [])).join(", ")}`;
 
-  const cancelBtn = isJobActive(job.status)
+  const headBtn = isJobActive(job.status)
     ? `<button type="button" class="job-cancel" data-cancel="${job.id}" aria-label="Cancel job">×</button>`
-    : "";
+    : `<button type="button" class="job-cancel" data-dismiss="${job.id}" aria-label="Remove from history">×</button>`;
 
   let body = renderJobProgress(job);
   if (job.status === "completed" && job.result) {
     const r = job.result;
     if (job.kind === "download") {
       body += `<p class="hint">Done: ${fmt(r.completed)} with data, ${fmt(r.empty)} empty, ${fmt(r.failed)} failed, ${fmt(r.ticks)} ticks.</p>`;
-    } else if (job.kind === "export") {
+    } else if (job.kind === "mt5_import") {
       const range = r.range ? `<br>${r.range}` : "";
-      body += `<p class="hint">Exported ${fmt(r.rows)} ticks from ${fmt(r.hours_with_data)} hours${range}<br><a href="/api/exports/file?path=${encodeURIComponent(r.path)}">${r.filename || r.path}</a></p>`;
+      const source =
+        r.ticks_source && r.ticks_source !== r.ticks_imported
+          ? ` · ${fmt(r.ticks_source)} ticks in source files`
+          : "";
+      body += `<p class="hint">Imported <strong>${r.custom_symbol || "?"}</strong> · ${fmt(r.ticks_imported)} ticks in MT5${source}${range}</p>`;
     } else if (job.kind === "gaps") {
       if (params.repair && r.ticks !== undefined) {
         body += `<p class="hint">Done: ${fmt(r.completed)} with data, ${fmt(r.empty)} empty, ${fmt(r.failed)} failed, ${fmt(r.ticks)} ticks.</p>`;
@@ -588,9 +672,11 @@ function renderJobCard(job) {
     body += `<p class="hint" style="color:var(--text-muted)">Stopped by user.</p>`;
   }
 
-  div.innerHTML = `<div class="job-head"><h3>${title} ${statusBadge(job.status)}</h3>${cancelBtn}</div>${body}`;
-  const btn = div.querySelector("[data-cancel]");
-  if (btn) btn.addEventListener("click", () => cancelJob(job.id));
+  div.innerHTML = `<div class="job-head"><h3>${title} ${statusBadge(job.status)}</h3>${headBtn}</div>${body}`;
+  const cancelBtn = div.querySelector("[data-cancel]");
+  if (cancelBtn) cancelBtn.addEventListener("click", () => cancelJob(job.id));
+  const dismissBtn = div.querySelector("[data-dismiss]");
+  if (dismissBtn) dismissBtn.addEventListener("click", () => dismissJob(job.id));
   return div;
 }
 
@@ -607,10 +693,26 @@ function renderJobs(jobsArr) {
     const prev = state.jobStatuses.get(job.id);
     const finished = job.status === "completed" || job.status === "failed" || job.status === "cancelled";
     if (prev && prev !== job.status && finished) {
-      if (job.status === "completed") toastSuccess("Job completed");
-      else if (job.status === "failed") toastError("Job failed");
+      if (job.status === "completed") {
+        if (job.kind === "mt5_import" && job.result?.custom_symbol) {
+          toastSuccess(
+            `${job.result.custom_symbol} imported — ${fmt(job.result.ticks_imported)} ticks`,
+          );
+          loadImports();
+          loadCustomSymbols();
+        } else {
+          toastSuccess("Job completed");
+        }
+      } else if (job.status === "failed") {
+        if (job.kind === "mt5_import") {
+          toastError(job.error || "MT5 import failed");
+          loadCustomSymbols();
+        } else {
+          toastError("Job failed");
+        }
+      }
       loadLibrary();
-      loadExports();
+      loadImports();
     }
     state.jobStatuses.set(job.id, job.status);
     if (!finished) anyActive = true;
@@ -676,14 +778,17 @@ $("#dl-start-btn").addEventListener("click", async () => {
   }
 });
 
-// -- export -------------------------------------------------------------------
+// -- import -------------------------------------------------------------------
 
 $("#ex-start-btn").addEventListener("click", async () => {
-  const symbol = $("#ex-symbol").value || $("#ex-search").value.trim();
-  if (!symbol) return toast("Select a symbol");
-  const exportAll = $("#ex-all").checked;
-  const body = { symbol, export_all: exportAll };
-  if (!exportAll) {
+  const symbol = $("#ex-symbol").value || $("#ex-search").value.trim().toUpperCase();
+  if (!symbol) return toast("Select a symbol from your library");
+  if (!state.librarySymbols.has(symbol)) {
+    return toastError(`${symbol} is not in your library — download it first`);
+  }
+  const importAll = $("#ex-all").checked;
+  const body = { symbol, import_all: importAll };
+  if (!importAll) {
     try {
       body.start = readDateInput("ex-start-picker", "Start date");
       body.end = readDateInput("ex-end-picker", "End date");
@@ -692,58 +797,40 @@ $("#ex-start-btn").addEventListener("click", async () => {
     }
   }
   try {
-    const job = await api("/api/export", { method: "POST", body: JSON.stringify(body) });
-    toastSuccess(exportAll ? "Export all started" : "Export started");
+    const job = await api("/api/mt5/import", { method: "POST", body: JSON.stringify(body) });
+    toastSuccess("MT5 import started");
     prependJob(job);
   } catch (e) {
     toastError(e.message);
   }
 });
 
-async function deleteExport(path, filename) {
-  if (
-    !(await appConfirm({
-      title: "Delete export?",
-      text: `Delete ${filename}?`,
-      confirmText: "Delete",
-    }))
-  ) {
-    return;
-  }
+async function loadImports() {
   try {
-    await api(`/api/exports/file?path=${encodeURIComponent(path)}`, { method: "DELETE" });
-    toastSuccess("Export deleted");
-    loadExports();
-  } catch (e) {
-    toastError(e.message);
-  }
-}
-
-async function loadExports() {
-  try {
-    const { exports } = await api("/api/exports");
-    const el = $("#export-list");
-    if (!exports.length) {
-      el.innerHTML = '<p class="empty">No exports yet.</p>';
+    const { jobs: jobsArr } = await api("/api/jobs");
+    const imports = (jobsArr || []).filter((j) => j.kind === "mt5_import").slice(0, 20);
+    const el = $("#import-list");
+    if (!el) return;
+    if (!imports.length) {
+      el.innerHTML = '<p class="empty">No imports yet.</p>';
       return;
     }
-    el.innerHTML = `<table><thead><tr><th>File</th><th>Size</th><th></th></tr></thead><tbody>${exports
-      .map(
-        (f) =>
-          `<tr><td>${f.filename}</td><td>${(f.size / 1024 / 1024).toFixed(2)} MB</td>
-          <td class="export-actions">
-            <a class="btn" href="/api/exports/file?path=${encodeURIComponent(f.path)}">Download</a>
-            <button type="button" class="job-cancel lib-delete" data-delete-export="${f.path}" aria-label="Delete ${f.filename}">×</button>
-          </td></tr>`,
-      )
+    el.innerHTML = `<table><thead><tr><th>Symbol</th><th>Custom</th><th>Ticks</th><th>Status</th></tr></thead><tbody>${imports
+      .map((j) => {
+        const r = j.result || {};
+        const ticks = j.status === "completed" ? fmt(r.ticks_imported) : "—";
+        const custom = r.custom_symbol || "—";
+        return `<tr>
+          <td>${j.params?.symbol || "?"}</td>
+          <td>${custom}</td>
+          <td>${ticks}</td>
+          <td>${statusBadge(j.status)}</td>
+        </tr>`;
+      })
       .join("")}</tbody></table>`;
-    el.querySelectorAll("[data-delete-export]").forEach((btn) => {
-      const path = btn.dataset.deleteExport;
-      const filename = exports.find((f) => f.path === path)?.filename || path;
-      btn.addEventListener("click", () => deleteExport(path, filename));
-    });
   } catch (e) {
-    $("#export-list").innerHTML = `<p class="empty">${e.message}</p>`;
+    const el = $("#import-list");
+    if (el) el.innerHTML = `<p class="empty">${e.message}</p>`;
   }
 }
 
@@ -832,7 +919,8 @@ async function deleteLibrarySymbol(symbol) {
   if (
     !(await appConfirm({
       title: `Delete ${symbol}?`,
-      text: "All stored data will be removed. This cannot be undone.",
+      html: `<p>All downloaded tick data for <strong>${symbol}</strong> will be removed from the library.</p>
+        <p class="swal-muted">This cannot be undone.</p>`,
       confirmText: "Delete",
     }))
   ) {
@@ -843,11 +931,11 @@ async function deleteLibrarySymbol(symbol) {
     state.downloadSymbols.delete(symbol);
     state.downloadAvailability.delete(symbol);
     state.gapSymbols.delete(symbol);
+    state.librarySymbols.delete(symbol);
     renderDownloadSymbolList();
     renderGapChips();
     toastSuccess(`${symbol} removed`);
     loadLibrary();
-    loadExports();
   } catch (e) {
     toastError(e.message);
   }
@@ -856,6 +944,7 @@ async function deleteLibrarySymbol(symbol) {
 async function loadLibrary() {
   try {
     const { instruments } = await api("/api/status");
+    state.librarySymbols = new Set((instruments || []).map((i) => i.symbol));
     const el = $("#library-table");
     if (!instruments.length) {
       el.innerHTML = '<p class="empty">No data stored yet. Start a download.</p>';
@@ -883,11 +972,101 @@ async function loadLibrary() {
   }
 }
 
+let customSymbolsLoading = false;
+
+function renderCustomSymbolsTable(symbols) {
+  const tableEl = $("#sym-table");
+  if (!symbols.length) {
+    tableEl.innerHTML =
+      '<p class="empty">No custom symbols yet. Import ticks to MT5 or click Refresh from MT5 to sync.</p>';
+    return;
+  }
+  tableEl.innerHTML = `<table><thead><tr><th>Symbol</th><th>Source</th><th>Ticks in MT5</th><th>First tick (UTC)</th><th>Last tick (UTC)</th><th></th></tr></thead><tbody>${symbols
+    .map(
+      (s) => `<tr>
+          <td><strong>${s.symbol}</strong></td>
+          <td class="hint">${s.source_symbol || "—"}</td>
+          <td>${fmt(s.ticks)}</td>
+          <td class="hint">${s.first_utc || "—"}</td>
+          <td class="hint">${s.last_utc || "—"}</td>
+          <td class="lib-actions"><button type="button" class="job-cancel sym-delete" data-delete-symbol="${s.symbol}" aria-label="Delete ${s.symbol}">×</button></td>
+        </tr>`,
+    )
+    .join("")}</tbody></table>`;
+  tableEl.querySelectorAll("[data-delete-symbol]").forEach((btn) => {
+    btn.addEventListener("click", () => deleteCustomSymbol(btn.dataset.deleteSymbol));
+  });
+}
+
+async function loadCustomSymbols() {
+  const statusEl = $("#sym-status");
+  const tableEl = $("#sym-table");
+  try {
+    const { symbols } = await api("/api/mt5/custom-symbols");
+    statusEl.textContent = symbols.length
+      ? `${symbols.length} symbol(s) · cached locally`
+      : "";
+    renderCustomSymbolsTable(symbols || []);
+  } catch (e) {
+    statusEl.textContent = "";
+    tableEl.innerHTML = `<p class="empty">${e.message}</p>`;
+  }
+}
+
+async function refreshCustomSymbolsFromMt5() {
+  const statusEl = $("#sym-status");
+  const tableEl = $("#sym-table");
+  const refreshBtn = $("#sym-refresh-btn");
+  if (customSymbolsLoading) return;
+  customSymbolsLoading = true;
+  if (refreshBtn) refreshBtn.disabled = true;
+  statusEl.textContent = "Launching MetaTrader 5 to read custom symbols…";
+  tableEl.innerHTML = '<p class="empty">Loading…</p>';
+  try {
+    const { symbols } = await api("/api/mt5/custom-symbols/refresh", { method: "POST" });
+    statusEl.textContent = symbols.length
+      ? `${symbols.length} symbol(s) synced from MT5`
+      : "No matching custom symbols found in MT5";
+    renderCustomSymbolsTable(symbols || []);
+  } catch (e) {
+    statusEl.textContent = "";
+    tableEl.innerHTML = `<p class="empty">${e.message}</p>`;
+  } finally {
+    customSymbolsLoading = false;
+    if (refreshBtn) refreshBtn.disabled = false;
+  }
+}
+
+async function deleteCustomSymbol(symbol) {
+  if (
+    !(await appConfirm({
+      title: `Delete ${symbol} from MT5?`,
+      html: `<p>Remove custom symbol <strong>${symbol}</strong> and all tick history from MetaTrader 5.</p>`,
+      confirmText: "Delete",
+    }))
+  ) {
+    return;
+  }
+  const statusEl = $("#sym-status");
+  statusEl.textContent = `Deleting ${symbol}…`;
+  try {
+    await api(`/api/mt5/custom-symbols/${encodeURIComponent(symbol)}`, { method: "DELETE" });
+    toastSuccess(`${symbol} deleted from MT5`);
+    await loadCustomSymbols();
+  } catch (e) {
+    console.error("MT5 delete failed:", e.message);
+    const short = String(e.message || "Delete failed").split("\n")[0];
+    const logHint = /Full log:/i.test(e.message || "") ? " — see data/logs/mt5_jobs.log" : "";
+    toastError(short + logHint);
+  }
+}
+
 // -- jobs list ----------------------------------------------------------------
 
 const loadJobs = refreshJobs;
 
 $("#lib-refresh").addEventListener("click", loadLibrary);
+$("#sym-refresh-btn")?.addEventListener("click", refreshCustomSymbolsFromMt5);
 $("#jobs-refresh").addEventListener("click", refreshJobs);
 
 // -- settings & automations ---------------------------------------------------
@@ -931,10 +1110,11 @@ function renderAutoChips() {
   const wrap = $("#auto-chips");
   if (!wrap) return;
   wrap.innerHTML = [...state.autoSymbols]
-    .map(
-      (sym) =>
-        `<span class="chip">${sym}<button type="button" data-auto-remove="${sym}" aria-label="Remove">×</button></span>`,
-    )
+    .map((sym) => {
+      const meta = state.searchCache.get(sym);
+      const badge = meta ? formatStoredBadge(meta) : "";
+      return `<span class="chip"><strong>${sym}</strong>${badge}<button type="button" data-auto-remove="${sym}" aria-label="Remove">×</button></span>`;
+    })
     .join("");
   wrap.querySelectorAll("[data-auto-remove]").forEach((btn) => {
     btn.addEventListener("click", () => {
@@ -1117,10 +1297,31 @@ async function loadSettings() {
     $("#set-default-workers").value = workers;
     const dlWorkers = $("#dl-workers");
     if (dlWorkers && !dlWorkers.dataset.userTouched) dlWorkers.value = workers;
+    const mt5 = data.mt5 || {};
+    const term = $("#set-mt5-terminal");
+    if (term) term.value = mt5.terminal_exe || "";
+    const dataPath = $("#set-mt5-data");
+    if (dataPath) dataPath.value = mt5.data_path || "";
+    const suffix = $("#set-mt5-suffix");
+    if (suffix) suffix.value = mt5.custom_suffix || ".DUK";
+    const origin = $("#set-mt5-origin");
+    if (origin) origin.value = mt5.origin_symbol || "";
     state.automations = data.automations || [];
     renderAutomationsList();
   } catch (e) {
     $("#auto-list").innerHTML = `<p class="empty">${e.message}</p>`;
+  }
+}
+
+async function saveMt5Settings(patch) {
+  try {
+    const { mt5 } = await api("/api/settings/mt5", { method: "PATCH", body: JSON.stringify(patch) });
+    if (mt5.terminal_exe != null) $("#set-mt5-terminal").value = mt5.terminal_exe;
+    if (mt5.data_path != null) $("#set-mt5-data").value = mt5.data_path;
+    if (mt5.custom_suffix != null) $("#set-mt5-suffix").value = mt5.custom_suffix;
+    if (mt5.origin_symbol != null) $("#set-mt5-origin").value = mt5.origin_symbol;
+  } catch (e) {
+    toastError(e.message);
   }
 }
 
@@ -1148,6 +1349,24 @@ $("#set-default-workers")?.addEventListener("change", (e) => {
   saveUiSettings({ default_workers: Number(e.target.value) || 15 });
 });
 
+let mt5SaveTimer = null;
+function queueMt5Save(patch) {
+  clearTimeout(mt5SaveTimer);
+  mt5SaveTimer = setTimeout(() => saveMt5Settings(patch), 400);
+}
+
+$("#set-mt5-terminal")?.addEventListener("input", (e) => {
+  queueMt5Save({ terminal_exe: e.target.value.trim() });
+});
+$("#set-mt5-data")?.addEventListener("input", (e) => {
+  queueMt5Save({ data_path: e.target.value.trim() });
+});
+$("#set-mt5-suffix")?.addEventListener("change", (e) => {
+  saveMt5Settings({ custom_suffix: e.target.value.trim() || ".DUK" });
+});
+$("#set-mt5-origin")?.addEventListener("input", (e) => {
+  queueMt5Save({ origin_symbol: e.target.value.trim() });
+});
 $("#dl-workers")?.addEventListener("input", () => {
   $("#dl-workers").dataset.userTouched = "1";
 });
@@ -1165,17 +1384,19 @@ $$('input[name="auto-symbols-source"]').forEach((el) => {
 setupSearch(
   "#auto-search",
   "#auto-suggestions",
-  (symbol) => {
+  (symbol, result) => {
+    if (result) state.searchCache.set(symbol, result);
     state.autoSymbols.add(symbol);
     renderAutoChips();
   },
-  { formatBadge: () => "" },
+  { formatBadge: formatStoredBadge },
 );
 
 // -- init ---------------------------------------------------------------------
 
 const savedTab = localStorage.getItem(TAB_STORAGE_KEY);
-switchTab(savedTab && VALID_TABS.has(savedTab) ? savedTab : "download", { save: false });
+const initialTab = savedTab === "export" ? "import" : savedTab;
+switchTab(initialTab && VALID_TABS.has(initialTab) ? initialTab : "download", { save: false });
 loadSettings();
 loadLibrary();
-loadExports();
+loadImports();

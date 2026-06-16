@@ -17,17 +17,19 @@ import requests
 from config.settings import Settings
 from core.exceptions import JobCancelled
 from core.models.task import HourTask, TaskProfile, TaskStatus
-from core.services.decoder import DecodeError, decode_jetta_table
+from core.models.tick_batch import TickBatch
+from core.services.decoder import DecodeError, decode_jetta_batch
 from core.services.http_client import (
     loads_json,
     session_initializer,
+    warmup_session,
     worker_session,
 )
 from core.services.progress import ProgressBar
 from core.services.retry_manager import PermanentError, RetryableError, RetryManager
-from core.services.verification import verify_table
+from core.services.verification import verify_batch
 from storage.metadata_db import MetadataDB
-from storage.parquet_storage import ParquetStorage
+from storage.tick_storage import TickStorage
 
 _RETRYABLE_HTTP = {408, 425, 429, 500, 502, 503, 504}
 _PROFILE_RECENT_LIMIT = 80
@@ -79,7 +81,7 @@ class DownloadStats:
 
 
 class DownloadEngine:
-    def __init__(self, settings: Settings, storage: ParquetStorage, db: MetadataDB):
+    def __init__(self, settings: Settings, storage: TickStorage, db: MetadataDB):
         self.settings = settings
         self.storage = storage
         self.db = db
@@ -112,7 +114,7 @@ class DownloadEngine:
             raise RetryableError(f"HTTP {status}")
         raise PermanentError(f"HTTP {status}")
 
-    def _fetch_decode_verify(self, task: HourTask) -> tuple[object | None, TaskProfile]:
+    def _fetch_decode_verify(self, task: HourTask) -> tuple[TickBatch | None, TaskProfile]:
         profile = TaskProfile()
         url = task.tick_url(self.settings.base_url)
         body, profile.fetch_ms = self._fetch_body(url)
@@ -122,7 +124,7 @@ class DownloadEngine:
         decode_started = time.perf_counter()
         try:
             payload = loads_json(body)
-            table = decode_jetta_table(
+            batch = decode_jetta_batch(
                 payload,
                 task.hour_start_ms,
                 task.hour_end_ms,
@@ -132,15 +134,15 @@ class DownloadEngine:
         except (ValueError, TypeError) as exc:
             raise RetryableError(f"invalid JSON from {url}: {exc}") from exc
 
-        if table.num_rows == 0:
+        if batch.num_rows == 0:
             profile.decode_ms = (time.perf_counter() - decode_started) * 1000
             return None, profile
 
-        check = verify_table(table, task.hour_start_ms)
+        check = verify_batch(batch, task.hour_start_ms)
         profile.decode_ms = (time.perf_counter() - decode_started) * 1000
         if not check.ok:
             raise RetryableError(f"verification failed: {check.reason}")
-        return table, profile
+        return batch, profile
 
     def _process(self, task: HourTask) -> HourTask:
         if self._should_cancel and self._should_cancel():
@@ -162,14 +164,14 @@ class DownloadEngine:
 
         profile = TaskProfile()
 
-        def attempt() -> object | None:
+        def attempt() -> TickBatch | None:
             nonlocal profile
-            table, profile = self._fetch_decode_verify(task)
-            return table
+            batch, profile = self._fetch_decode_verify(task)
+            return batch
 
-        table = self.retry.run(attempt)
+        batch = self.retry.run(attempt)
 
-        if table is None:
+        if batch is None:
             self.db.mark(instrument.id, hour, TaskStatus.EMPTY)
             task.status = TaskStatus.EMPTY
             profile.total_ms = (time.perf_counter() - started) * 1000
@@ -178,8 +180,8 @@ class DownloadEngine:
             return task
 
         write_started = time.perf_counter()
-        tick_count = table.num_rows
-        path = self.storage.write_hour_table(instrument, hour, table)
+        tick_count = batch.num_rows
+        path = self.storage.write_hour_batch(instrument, hour, batch)
         self.db.mark(
             instrument.id, hour, TaskStatus.COMPLETED,
             tick_count=tick_count, file_path=str(path),
@@ -322,6 +324,7 @@ class DownloadEngine:
                 on_task_done(task)
 
         emit()
+        warmup_session(self.settings)
         with ThreadPoolExecutor(
             max_workers=workers,
             initializer=session_initializer(self.settings),
