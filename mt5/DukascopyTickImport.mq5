@@ -955,27 +955,24 @@ void OnStart()
    string ticksTotalStr = ManifestValue("ticks_total");
    long ticksTotal = (ticksTotalStr != "") ? (long)StringToInteger(ticksTotalStr) : 0;
 
-   WriteProgress("running", "count_ticks", 0, 0, 5, customSymbol, "Preparing import...");
-
-   if(ticksTotal <= 0)
+   // Hours mode: do not scan/count files — just pump. ticks_total is optional UI hint.
+   if(ticksTotal <= 0 && tickMode != "hours")
      {
-      if(tickFormat == "bin_v1" && tickMode != "hours")
+      if(tickFormat == "bin_v1")
         {
-         WriteProgress("error", "count_ticks", 0, 0, 0, customSymbol,
+         WriteProgress("error", "import", 0, 0, 0, customSymbol,
                        "ticks_total missing from manifest", 0);
          return;
         }
-      if(tickMode != "hours")
-         ticksTotal = CountCsvTicks(tickPath);
+      ticksTotal = CountCsvTicks(tickPath);
+      if(ticksTotal <= 0)
+        {
+         WriteProgress("error", "import", 0, 0, 0, customSymbol, "No ticks in staging file", 0);
+         return;
+        }
      }
 
-   if(ticksTotal <= 0 && tickMode != "hours")
-     {
-      WriteProgress("error", "count_ticks", 0, 0, 0, customSymbol, "No ticks in staging file", 0);
-      return;
-     }
-
-   WriteProgress("running", "import_ticks", 0, ticksTotal, 10, customSymbol, "Importing ticks...");
+   WriteProgress("running", "import", 0, ticksTotal, 5, customSymbol, "Importing ticks...");
 
    long ticksImported = 0;
    bool ok = false;
