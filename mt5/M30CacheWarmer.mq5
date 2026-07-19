@@ -1,16 +1,18 @@
 //+------------------------------------------------------------------+
-//| M30CacheWarmer.mq5 — export M30 bars to Common Files disk cache   |
-//| Live chart: build cache. Tester: import cache (not used by tool). |
+//| M30CacheWarmer.mq5 — export M30 OHLC bars to Common Files cache   |
+//| Live: CopyRates → M30Cache\M30_<symbol>.bin (format v1).          |
+//| Tester: diagnostic import only. Does NOT write ticks.             |
+//| Not Vector BarCache (that is version 2 / BarCache folder).        |
 //+------------------------------------------------------------------+
 #property copyright "Dukascopy Downloader"
 #property version   "1.00"
 #property strict
-#property description "M30 disk cache: export on live chart, import in Strategy Tester"
+#property description "M30 OHLC disk cache: export on live chart (M30Cache/*.bin)"
 
 input group "M30 cache";
 input string InpCacheSubfolder = "M30Cache"; // Under Terminal\\Common\\Files
-input bool   InpForceRebuild     = false;    // Live only: overwrite existing cache
-input string InpJobId              = "";       // Optional: write dukascopy job progress
+input bool   InpForceRebuild   = false;      // Live only: overwrite existing cache
+input string InpJobId          = "";         // Optional: dukascopy_jobs progress.txt
 
 #define JOB_ROOT "dukascopy_jobs\\"
 
@@ -33,6 +35,7 @@ void WriteJobProgress(const string state, const string phase, const int percent,
    if(h == INVALID_HANDLE)
       return;
 
+   // ticks_* are job-protocol stubs — this EA writes M30 bars, not ticks
    FileWriteString(h,
                    "state=" + state + "\n"
                    + "phase=" + phase + "\n"
@@ -47,10 +50,10 @@ void WriteJobProgress(const string state, const string phase, const int percent,
   }
 
 //+------------------------------------------------------------------+
+// Keep '.' in symbol names (e.g. EURUSD.DUK). Replace path-hostile chars only.
 string SanitizeSymbolForFileName(const string symbol)
   {
    string safe = symbol;
-   StringReplace(safe, ".", "_");
    StringReplace(safe, ":", "_");
    StringReplace(safe, "\\", "_");
    StringReplace(safe, "/", "_");
@@ -113,6 +116,7 @@ bool ReadLengthPrefixedString(const int handle, string &text)
   }
 
 //+------------------------------------------------------------------+
+// Format v1: int32 version | int32 utf8_len | utf8 bytes | int32 bar_count | MqlRates[]
 bool WriteM30Cache(const MqlRates &rates[], const int count)
   {
    const string fileName = BuildCacheFileName();
@@ -166,7 +170,8 @@ bool ReadM30Cache(MqlRates &rates[], int &count, string &symbol)
    if(version != CACHE_FORMAT_VERSION)
      {
       FileClose(handle);
-      Print("M30 cache import failed | unsupported version=", version);
+      Print("M30 cache import failed | unsupported version=", version,
+            " (this warmer is v1 / M30Cache — not Vector BarCache v2)");
       return false;
      }
 
@@ -244,7 +249,7 @@ void LogImportedCacheSummary(const MqlRates &rates[], const int count, const str
 //+------------------------------------------------------------------+
 int RunLiveExport()
   {
-   Print("M30 cache | live chart detected — export mode");
+   Print("M30 cache | live chart — export M30 OHLC bars");
 
    if(CacheFileExists() && !InpForceRebuild)
      {
@@ -277,7 +282,7 @@ int RunLiveExport()
 //+------------------------------------------------------------------+
 int RunTesterImport()
   {
-   Print("M30 cache | Strategy Tester detected — import mode");
+   Print("M30 cache | Strategy Tester — diagnostic import");
 
    if(!CacheFileExists())
      {

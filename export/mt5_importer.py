@@ -204,12 +204,8 @@ def write_m30_expert_set(path: Path, job_id: str) -> None:
 
 
 def m30_cache_file_path(symbol: str, subfolder: str = M30_CACHE_SUBFOLDER) -> Path:
-    safe = (
-        symbol.replace(".", "_")
-        .replace(":", "_")
-        .replace("\\", "_")
-        .replace("/", "_")
-    )
+    # Keep '.' (e.g. EURUSD.DUK); only strip path-hostile chars — matches M30CacheWarmer.mq5
+    safe = symbol.replace(":", "_").replace("\\", "_").replace("/", "_")
     return common_files_dir() / subfolder / f"M30_{safe}.bin"
 
 
