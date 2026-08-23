@@ -5,6 +5,7 @@
     python main.py gaps     <SYMBOL> <START> <END> [--repair]
     python main.py gaps     <SYMBOL> --all [--repair]
     python main.py status   <SYMBOL>
+    python main.py export-csv <SYMBOL> <START> <END> [--output PATH]
     python main.py migrate  [--dry-run] [--keep-parquet]
     python main.py web      [--host HOST] [--port PORT]
 """
@@ -14,6 +15,7 @@ import argparse
 import sys
 import threading
 from datetime import date, datetime
+from pathlib import Path
 
 from config.settings import Settings
 from core.models.task import TaskStatus
@@ -95,6 +97,17 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_status = sub.add_parser("status", help="show stored data summary for an instrument")
     p_status.add_argument("symbol")
+
+    p_csv = sub.add_parser(
+        "export-csv",
+        help="export a complete stored range as one MT5-compatible tick CSV",
+    )
+    add_range_args(p_csv)
+    p_csv.add_argument(
+        "--output",
+        help="destination CSV path (default: data/mt5_csv/<symbol>_ticks_<start>_<end>.csv)",
+    )
+    p_csv.add_argument("--force", action="store_true", help="replace an existing output CSV")
 
     p_migrate = sub.add_parser(
         "migrate",
@@ -329,6 +342,54 @@ def cmd_migrate(settings: Settings, args) -> int:
     return 0
 
 
+def cmd_export_csv(settings: Settings, catalog: InstrumentCatalog, args) -> int:
+    from datetime import timezone
+
+    from core.exceptions import IncompleteDatasetError
+    from core.services.gap_scanner import require_complete_import
+    from export.mt5_csv import export_mt5_csv
+
+    instrument = catalog.get(args.symbol)
+    _validate_range(args.start, args.end)
+    db = MetadataDB(settings.db_path)
+    scanner = GapScanner(settings, db)
+    report, range_label = scanner.scan_for_import(
+        instrument, start=args.start, end=args.end,
+    )
+    try:
+        require_complete_import(report, instrument.symbol, range_label)
+    except IncompleteDatasetError as exc:
+        raise SystemExit(f"error: {exc}") from exc
+
+    output = Path(args.output) if args.output else (
+        settings.data_dir / "mt5_csv" /
+        f"{instrument.symbol}_ticks_{args.start:%Y-%m-%d}_{args.end:%Y-%m-%d}.csv"
+    )
+    if not output.is_absolute():
+        output = Path.cwd() / output
+    storage = TickStorage(settings.data_dir)
+    start_hour = datetime(args.start.year, args.start.month, args.start.day, tzinfo=timezone.utc)
+    end_hour = datetime(args.end.year, args.end.month, args.end.day, 23, tzinfo=timezone.utc)
+    paths = [storage.hour_path(instrument, hour) for hour in storage.list_stored_hours(
+        instrument, start_hour, end_hour,
+    )]
+
+    def progress(done: int, total: int, ticks: int) -> None:
+        if done % 500 == 0 or done == total:
+            print(f"Exporting: {done:,} / {total:,} hour files, {ticks:,} ticks", flush=True)
+
+    try:
+        result = export_mt5_csv(
+            paths, output, decimals=instrument.price_decimals,
+            overwrite=args.force, on_progress=progress,
+        )
+    except FileExistsError as exc:
+        raise SystemExit(f"error: {exc} (use --force to replace it)") from exc
+
+    print(f"Created {result.output_path} ({result.ticks:,} ticks from {result.hour_files:,} hour files).")
+    return 0
+
+
 def cmd_web(args) -> int:
     import logging
 
@@ -383,6 +444,8 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_gaps(settings, catalog, args)
         if args.command == "status":
             return cmd_status(settings, catalog, args)
+        if args.command == "export-csv":
+            return cmd_export_csv(settings, catalog, args)
         if args.command == "migrate":
             return cmd_migrate(settings, args)
         if args.command == "web":

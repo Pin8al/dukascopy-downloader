@@ -4,7 +4,7 @@
 //| Launched via [StartUp] Script= in import.ini (live terminal).     |
 //+------------------------------------------------------------------+
 #property copyright "Dukascopy Downloader"
-#property version   "1.19"
+#property version   "1.20"
 #property strict
 #property script_show_inputs
 
@@ -96,7 +96,11 @@ bool WriteProgressThrottled(const string state, const string phase, const long t
       g_lastProgressMs = now;
      }
    string path = JobDir() + "progress.txt";
-   int h = FileOpen(path, FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
+   // The Python controller polls this file while the script runs. Permit
+   // concurrent readers/writers so the final ticks_done marker is not lost
+   // to a transient sharing violation.
+   int h = FileOpen(path, FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON
+                         | FILE_SHARE_READ | FILE_SHARE_WRITE);
    if(h == INVALID_HANDLE)
      {
       Print("WriteProgress FileOpen failed: ", GetLastError());
@@ -282,6 +286,25 @@ bool ParseCsvTick(const string line, MqlTick &tick)
   }
 
 //+------------------------------------------------------------------+
+int OpenCommonRead(const string path, const int typeFlags)
+  {
+   const int attempts = 4;
+   int lastError = 0;
+   for(int attempt = 0; attempt < attempts; attempt++)
+     {
+      ResetLastError();
+      int h = FileOpen(path, FILE_READ | typeFlags | FILE_COMMON | FILE_SHARE_READ);
+      if(h != INVALID_HANDLE)
+         return h;
+      lastError = GetLastError();
+      if(attempt + 1 < attempts)
+         Sleep(250);
+     }
+   Print("file open failed after retries: ", path, " err=", lastError);
+   return INVALID_HANDLE;
+  }
+
+//+------------------------------------------------------------------+
 bool FlushDayTicks(const string customSymbol, MqlTick &ticks[], const int count,
                    long &ticksImported, const long ticksTotal)
   {
@@ -385,7 +408,7 @@ bool ImportBinaryStream(const int h, const string customSymbol,
 bool ImportTicksFromBinary(const string customSymbol, const string tickPath,
                            const long ticksTotal, long &ticksImported)
   {
-   int h = FileOpen(tickPath, FILE_READ | FILE_BIN | FILE_COMMON);
+   int h = OpenCommonRead(tickPath, FILE_BIN);
    if(h == INVALID_HANDLE)
      {
       Print("tick binary open failed: ", GetLastError());
@@ -419,7 +442,7 @@ bool ImportTicksFromBinary(const string customSymbol, const string tickPath,
 int CountHourFiles(const string hoursPath)
   {
    int total = 0;
-   int h = FileOpen(hoursPath, FILE_READ | FILE_TXT | FILE_ANSI | FILE_COMMON);
+   int h = OpenCommonRead(hoursPath, FILE_TXT | FILE_ANSI);
    if(h == INVALID_HANDLE)
       return 0;
    while(!FileIsEnding(h))
@@ -438,7 +461,7 @@ int CountHourFiles(const string hoursPath)
 bool ImportTicksFromHourFiles(const string customSymbol, const string hoursPath,
                               const long ticksTotal, long &ticksImported)
   {
-   int list = FileOpen(hoursPath, FILE_READ | FILE_TXT | FILE_ANSI | FILE_COMMON);
+   int list = OpenCommonRead(hoursPath, FILE_TXT | FILE_ANSI);
    if(list == INVALID_HANDLE)
      {
       Print("hours manifest open failed: ", GetLastError());
@@ -468,7 +491,7 @@ bool ImportTicksFromHourFiles(const string customSymbol, const string hoursPath,
          continue;
 
       string hourPath = jobDir + line;
-      int h = FileOpen(hourPath, FILE_READ | FILE_BIN | FILE_COMMON);
+      int h = OpenCommonRead(hourPath, FILE_BIN);
       if(h == INVALID_HANDLE)
         {
          Print("hour file open failed: ", hourPath, " err=", GetLastError());
@@ -868,7 +891,7 @@ void OnStart()
       return;
      }
 
-   JobLog("OnStart v1.18 JobId=" + JobId + " chart=" + _Symbol);
+   JobLog("OnStart v1.20 JobId=" + JobId + " chart=" + _Symbol);
 
    string action = ManifestValue("action");
    if(action == "list")

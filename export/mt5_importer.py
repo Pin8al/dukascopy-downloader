@@ -18,6 +18,7 @@ from core.models.instrument import Instrument
 from core.services.planner import Planner
 from export.mt5_tick_publisher import HOURS_MANIFEST, MT5TickPublisher
 from storage.metadata_db import MetadataDB
+from storage.tick_format import count_ticks_in_files
 from storage.tick_storage import TickStorage
 
 MT5_BUNDLE_DIR = BASE_DIR / "mt5"
@@ -29,7 +30,6 @@ M30_EA_MQ5_NAME = f"{M30_EA_BASE_NAME}.mq5"
 M30_EA_EX5_NAME = f"{M30_EA_BASE_NAME}.ex5"
 M30_CACHE_SUBFOLDER = "M30Cache"
 M30_WARMUP_TIMEOUT_SEC = 5 * 60
-IMPORT_STALL_SEC = 90
 LEGACY_IMPORT_NAMES = (
     "DukascopyImport.mq5",
     "DukascopyImport.ex5",
@@ -44,6 +44,10 @@ _import_lock = threading.Lock()
 _active_terminal: dict[str, Path] = {}
 IMPORT_TIMEOUT_SEC = 6 * 3600
 MT5_STARTUP_TIMEOUT_SEC = 120
+# MT5 can intermittently fail to open a file after a very large Common\Files
+# job folder.  Keep each script run below that practical limit and append the
+# batches into the same custom symbol.
+MAX_HOUR_FILES_PER_IMPORT = 10_000
 
 
 @dataclass
@@ -593,32 +597,6 @@ def abort_mt5_import(
             pass
 
 
-def _progress_snapshot_key(progress: dict[str, Any]) -> tuple[Any, ...]:
-    return (
-        str(progress.get("state", "")),
-        str(progress.get("phase", "")),
-        int(progress.get("percent", 0)),
-        int(progress.get("files_done", 0)),
-        int(progress.get("ticks_imported", 0)),
-    )
-
-
-def _synthesize_ticks_done(
-    progress: dict[str, Any],
-    custom_name: str,
-    *,
-    message: str,
-) -> dict[str, Any]:
-    return {
-        **progress,
-        "state": "ticks_done",
-        "phase": "import_ticks",
-        "percent": 90,
-        "custom_symbol": progress.get("custom_symbol", custom_name),
-        "message": message,
-    }
-
-
 def _import_progress_payload(
     progress: dict[str, Any],
     custom_name: str,
@@ -656,8 +634,6 @@ def _wait_for_mt5_import(
     started = time.monotonic()
     startup_deadline = started + MT5_STARTUP_TIMEOUT_SEC
     saw_progress = False
-    last_snap: tuple[Any, ...] | None = None
-    stall_since: float | None = None
 
     while time.monotonic() - started < IMPORT_TIMEOUT_SEC:
         if should_cancel and should_cancel():
@@ -681,36 +657,11 @@ def _wait_for_mt5_import(
 
         files_done = int(final_progress.get("files_done", 0))
         files_total = int(final_progress.get("files_total", 0))
-        if (
-            state == "running"
-            and phase == "import_ticks"
-            and files_total > 0
-            and files_done >= files_total
-        ):
-            kill_mt5_terminal(terminal_exe)
-            return _synthesize_ticks_done(
-                final_progress,
-                custom_name,
-                message="Hour files imported — warming M30 cache next",
-            )
-
         now = time.monotonic()
-        snap = _progress_snapshot_key(final_progress) if final_progress else None
-        if snap and snap == last_snap and state == "running" and phase == "import_ticks":
-            if stall_since is None:
-                stall_since = now
-            elif now - stall_since >= IMPORT_STALL_SEC:
-                pct = int(final_progress.get("percent", 0))
-                if pct >= 40 or files_done > 0:
-                    kill_mt5_terminal(terminal_exe)
-                    return _synthesize_ticks_done(
-                        final_progress,
-                        custom_name,
-                        message="Import progress stalled — continuing with M30 cache warmup",
-                    )
-        else:
-            stall_since = None
-            last_snap = snap
+        # A large CustomTicksReplace call can legitimately take longer than
+        # a minute without publishing another hour-level update. Never treat
+        # a paused progress file as a completed import; wait for MT5's explicit
+        # ticks_done/done state (or the overall import timeout).
 
         if on_progress and now - last_emit >= 0.5:
             last_emit = now
@@ -738,6 +689,7 @@ def import_ticks(
     import_all: bool,
     range_start: date | None,
     range_end: date | None,
+    warm_cache: bool = True,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
@@ -752,6 +704,7 @@ def import_ticks(
             import_all=import_all,
             range_start=range_start,
             range_end=range_end,
+            warm_cache=warm_cache,
             on_progress=on_progress,
             should_cancel=should_cancel,
         )
@@ -767,6 +720,7 @@ def _import_ticks_locked(
     import_all: bool,
     range_start: date | None,
     range_end: date | None,
+    warm_cache: bool,
     on_progress: Callable[[dict[str, Any]], None] | None = None,
     should_cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
@@ -831,17 +785,18 @@ def _import_ticks_locked(
         if state == "ticks_done":
             imported = int(final_progress.get("ticks_imported", 0))
             total = int(final_progress.get("ticks_total", 0))
-            _run_m30_cache_warmup(
-                mt5,
-                custom_symbol=str(final_progress.get("custom_symbol", custom_name)),
-                job_id=job_id,
-                progress_path=progress_path,
-                staging_dir=staging_dir,
-                ticks_imported=imported,
-                ticks_total=total,
-                on_progress=on_progress,
-                should_cancel=should_cancel,
-            )
+            if warm_cache:
+                _run_m30_cache_warmup(
+                    mt5,
+                    custom_symbol=str(final_progress.get("custom_symbol", custom_name)),
+                    job_id=job_id,
+                    progress_path=progress_path,
+                    staging_dir=staging_dir,
+                    ticks_imported=imported,
+                    ticks_total=total,
+                    on_progress=on_progress,
+                    should_cancel=should_cancel,
+                )
             import_ok = True
             return {
                 "custom_symbol": final_progress.get("custom_symbol", custom_name),
@@ -854,17 +809,18 @@ def _import_ticks_locked(
         if state == "done":
             imported = int(final_progress.get("ticks_imported", 0))
             total = int(final_progress.get("ticks_total", imported))
-            _run_m30_cache_warmup(
-                mt5,
-                custom_symbol=str(final_progress.get("custom_symbol", custom_name)),
-                job_id=job_id,
-                progress_path=progress_path,
-                staging_dir=staging_dir,
-                ticks_imported=imported,
-                ticks_total=total,
-                on_progress=on_progress,
-                should_cancel=should_cancel,
-            )
+            if warm_cache:
+                _run_m30_cache_warmup(
+                    mt5,
+                    custom_symbol=str(final_progress.get("custom_symbol", custom_name)),
+                    job_id=job_id,
+                    progress_path=progress_path,
+                    staging_dir=staging_dir,
+                    ticks_imported=imported,
+                    ticks_total=total,
+                    on_progress=on_progress,
+                    should_cancel=should_cancel,
+                )
             import_ok = True
             return {
                 "custom_symbol": final_progress.get("custom_symbol", custom_name),
@@ -884,10 +840,12 @@ def _import_ticks_locked(
         )
     finally:
         _active_terminal.pop(job_id, None)
-        if import_ok:
-            cleanup_staging(mt5, job_id, remove_job_files=True, remove_script=False)
-        else:
-            cleanup_staging(mt5, job_id, remove_job_files=True, remove_script=False)
+        # MT5 may retain the last input/progress file after an error. Stop it
+        # before cleanup so an incomplete cleanup cannot leave a mixed job.
+        if not import_ok:
+            kill_mt5_terminal(mt5.terminal_exe)
+            wait_mt5_exit(mt5.terminal_exe)
+        cleanup_staging(mt5, job_id, remove_job_files=True, remove_script=False)
         if staging_dir.exists():
             shutil.rmtree(staging_dir, ignore_errors=True)
 
@@ -914,8 +872,6 @@ def prepare_and_import(
     kill_mt5_terminal(mt5.terminal_exe)
     wait_mt5_exit(mt5.terminal_exe)
 
-    job_dir = common_files_dir() / JOB_ROOT / job_id
-    job_dir.mkdir(parents=True, exist_ok=True)
     staging_dir = settings.data_dir / "mt5_staging" / job_id
     staging_dir.mkdir(parents=True, exist_ok=True)
     publisher = MT5TickPublisher(settings, store, planner, metadata)
@@ -943,65 +899,108 @@ def prepare_and_import(
                 "percent": 1,
                 "phase": "prepare",
             })
-        if import_all:
-            span_start = start
-            span_end = end
-            if span_start is None or span_end is None:
-                raise ValueError("import span missing for import_all")
-            result = publisher.publish_all(
-                instrument,
-                datetime(span_start.year, span_start.month, span_start.day, tzinfo=timezone.utc),
-                datetime(span_end.year, span_end.month, span_end.day, 23, tzinfo=timezone.utc),
-                job_dir,
-                on_progress=publish_progress,
-                should_cancel=should_cancel,
-            )
-        else:
-            if start is None or end is None:
-                raise ValueError("start and end dates required")
-            result = publisher.publish(
-                instrument,
-                start,
-                end,
-                job_dir,
-                on_progress=publish_progress,
+        if start is None or end is None:
+            raise ValueError("import span missing")
+
+        span_start = datetime(start.year, start.month, start.day, tzinfo=timezone.utc)
+        span_end = datetime(end.year, end.month, end.day, 23, tzinfo=timezone.utc)
+        sources, ticks_source = publisher.resolve_sources(instrument, span_start, span_end)
+        if not sources:
+            raise FileNotFoundError("No hour tick files found for import range")
+
+        batch_count = (len(sources) + MAX_HOUR_FILES_PER_IMPORT - 1) // MAX_HOUR_FILES_PER_IMPORT
+        imported_total = 0
+        files_total = 0
+
+        for batch_number, offset in enumerate(range(0, len(sources), MAX_HOUR_FILES_PER_IMPORT), start=1):
+            if should_cancel and should_cancel():
+                raise JobCancelled()
+
+            batch_sources = sources[offset: offset + MAX_HOUR_FILES_PER_IMPORT]
+            batch_ticks = count_ticks_in_files(batch_sources)
+            batch_job_id = f"{job_id}-{batch_number:02d}"
+            batch_dir = common_files_dir() / JOB_ROOT / batch_job_id
+
+            def batch_publish_progress(snapshot: dict[str, Any]) -> None:
+                if not on_progress:
+                    return
+                publish_progress({
+                    **snapshot,
+                    "message": (
+                        f"Preparing batch {batch_number} / {batch_count} · "
+                        f"{snapshot.get('done', 0):,} / {snapshot.get('files_total', 0):,} hour file(s)"
+                    ),
+                })
+
+            result = publisher.publish_sources(
+                batch_sources,
+                batch_ticks,
+                batch_dir,
+                on_progress=batch_publish_progress,
                 should_cancel=should_cancel,
             )
 
-        if should_cancel and should_cancel():
-            raise JobCancelled()
+            if batch_number > 1:
+                kill_mt5_terminal(mt5.terminal_exe)
+                wait_mt5_exit(mt5.terminal_exe)
 
-        manifest = {
-            "job_id": job_id,
-            "source_symbol": instrument.symbol,
+            manifest = {
+                "job_id": batch_job_id,
+                "source_symbol": instrument.symbol,
+                "custom_symbol": custom_name,
+                "custom_path": "dukascopy",
+                "origin_symbol": origin,
+                "digits": str(instrument.price_decimals),
+                # The first batch replaces the partial failed import; later
+                # batches append their dates into the same custom symbol.
+                "replace_existing": "1" if batch_number == 1 else "0",
+                "tick_format": "bin_v1",
+                "tick_mode": "hours",
+                "hours_file": HOURS_MANIFEST,
+                "ticks_total": str(result.rows),
+                "hours_total": str(result.files_published),
+            }
+            if on_progress:
+                on_progress({
+                    "message": f"Importing batch {batch_number} / {batch_count}…",
+                    "percent": round(100 * (batch_number - 1) / batch_count, 1),
+                    "phase": "import_ticks",
+                    "custom_symbol": custom_name,
+                    "files_done": files_total,
+                    "files_total": len(sources),
+                    "ticks_imported": imported_total,
+                    "ticks_total": ticks_source,
+                })
+
+            import_result = import_ticks(
+                settings,
+                mt5_raw,
+                instrument,
+                job_id=batch_job_id,
+                manifest_fields=manifest,
+                import_all=import_all,
+                range_start=start,
+                range_end=end,
+                # Tick history is the import contract. The optional M30 cache
+                # is generated lazily by MT5 when a chart/tester needs it, and
+                # should not delay or invalidate a successful tick import.
+                warm_cache=False,
+                on_progress=on_progress,
+                should_cancel=should_cancel,
+            )
+            imported_total += int(import_result.get("ticks_imported", 0))
+            files_total += result.hours_with_data
+
+        return {
             "custom_symbol": custom_name,
-            "custom_path": "dukascopy",
-            "origin_symbol": origin,
-            "digits": str(instrument.price_decimals),
-            "replace_existing": "1",
-            "tick_format": "bin_v1",
-            "tick_mode": "hours",
-            "hours_file": HOURS_MANIFEST,
-            "ticks_total": str(result.rows),
-            "hours_total": str(result.files_published),
+            "ticks_imported": imported_total,
+            "ticks_total": ticks_source,
+            "ticks_source": ticks_source,
+            "source_symbol": instrument.symbol,
+            "import_all": import_all,
+            "range": range_label,
+            "hours_with_data": files_total,
         }
-
-        import_result = import_ticks(
-            settings,
-            mt5_raw,
-            instrument,
-            job_id=job_id,
-            manifest_fields=manifest,
-            import_all=import_all,
-            range_start=start,
-            range_end=end,
-            on_progress=on_progress,
-            should_cancel=should_cancel,
-        )
-        import_result["ticks_source"] = result.rows
-        import_result["range"] = range_label
-        import_result["hours_with_data"] = result.hours_with_data
-        return import_result
     except JobCancelled:
         abort_mt5_import(job_id, mt5_raw, settings=settings)
         raise
