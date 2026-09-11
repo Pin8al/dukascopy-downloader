@@ -84,6 +84,29 @@ class MT5TickPublisher:
             on_progress=on_progress, should_cancel=should_cancel,
         )
 
+    def publish_sources(
+        self,
+        sources: list[Path],
+        total_ticks: int,
+        job_dir: Path,
+        on_progress: Callable[[dict], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> PublishResult:
+        """Publish a caller-selected source batch for a single MT5 import run."""
+        return self._publish_sources(
+            sources, total_ticks, job_dir,
+            on_progress=on_progress, should_cancel=should_cancel,
+        )
+
+    def resolve_sources(
+        self,
+        instrument: Instrument,
+        start_hour: datetime,
+        end_hour: datetime,
+    ) -> tuple[list[Path], int]:
+        """Return the ordered, non-empty hour files for a requested span."""
+        return self._resolve_sources(instrument, start_hour, end_hour)
+
     def _resolve_sources(
         self,
         instrument: Instrument,

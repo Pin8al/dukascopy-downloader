@@ -54,6 +54,9 @@ python main.py gaps EURUSD --all --repair --refetch-empty   # also re-request em
 
 # What is stored locally?
 python main.py status EURUSD
+
+# Export a complete stored range to one MT5 tick CSV (tab-separated, no header)
+python main.py export-csv EURUSD 2017-01-01 2026-08-21 --output EURUSD_ticks.csv
 ```
 
 `download` options: `--workers N` (default 15, max 64), `--force`, `--profile`
@@ -91,7 +94,24 @@ plan hours -> fetch JETTA JSON (parallel) -> decode -> verify -> .bin (atomic)
 Downloads are already MT5-ready. Import hard-links each hour `.bin` into the
 MT5 job folder (no concat copy) and launches MetaTrader 5 with
 `DukascopyTickImport.mq5`, which reads `hours.txt` and imports each file
-via `CustomTicksReplace`.
+via `CustomTicksReplace`. Large histories are split into bounded batches; the
+first batch replaces the custom symbol history and following batches append
+their non-overlapping dates. The controller waits for MT5's explicit completion
+state rather than treating a quiet progress update as success.
+
+### CSV fallback / manual import
+
+If you prefer MT5's native tick importer, export any complete downloaded range
+to one tab-separated, headerless CSV:
+
+```powershell
+python main.py export-csv EURUSD 2017-01-01 2026-08-21 --output EURUSD_ticks.csv
+```
+
+The command verifies that the selected range has no missing or failed hours,
+writes atomically, and preserves millisecond timestamps. In MT5, open the
+custom symbol's **Ticks** tab and choose **Import Ticks**. Use the default
+six-column mapping: date, time, bid, ask, last, volume.
 
 ## Layout
 
@@ -101,7 +121,7 @@ core/
   services/      instrument_search, planner, download_engine,
                  retry_manager, decoder, verification, gap_scanner
 storage/         tick_storage, tick_format, metadata_db, parquet_migration
-export/          mt5_tick_publisher, mt5_importer
+export/          mt5_tick_publisher, mt5_importer, mt5_csv
 mt5/             DukascopyTickImport.mq5
 config/          settings, instruments.json
 cli/             commands
